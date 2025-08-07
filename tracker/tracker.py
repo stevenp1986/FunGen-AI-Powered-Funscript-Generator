@@ -1580,8 +1580,9 @@ class ROITracker:
         global_dy = np.median(flow[..., 1])
 
         # --- Step 2: Identify Active Cells & Apply VR Focus ---
-        min_motion_threshold = 15
-        min_cell_activation_pixels = (self.oscillation_block_size**2) * 0.05
+        # PATCH: Make thresholds inversely proportional to sensitivity
+        min_motion_threshold = 15 / self.oscillation_sensitivity
+        min_cell_activation_pixels = (self.oscillation_block_size**2) * 0.05 / self.oscillation_sensitivity
 
         frame_diff = cv2.absdiff(current_gray, self.prev_gray_oscillation)
         _, motion_mask = cv2.threshold(frame_diff, min_motion_threshold, 255, cv2.THRESH_BINARY)
@@ -1645,7 +1646,7 @@ class ROITracker:
             for motion in block_motions:
                 history = self.oscillation_history.get(motion['pos'])
                 # Only consider blocks with some history and current motion
-                if history and len(history) > 10 and motion['mag'] > 0.2:
+                if history and len(history) > 10 and motion['mag'] > (0.2 / self.oscillation_sensitivity):
 
                     # 1. Get stats from history
                     recent_dy = [h['dy'] for h in history]
@@ -1664,7 +1665,9 @@ class ROITracker:
                     # This rewards blocks that are strong, frequent, and non-linear
                     oscillation_score = mean_mag * (1 + frequency_score) * (1 + variance_score)
 
-                    if oscillation_score > 0.5: # Filter out low-scoring blocks
+                    oscillation_score_threshold = 0.5 / self.oscillation_sensitivity  # Lower threshold for higher sensitivity
+
+                    if oscillation_score > oscillation_score_threshold:
                         candidate_blocks.append({'pos': motion['pos'], 'score': oscillation_score, 'dy': motion['dy'], 'dx': motion['dx']})
 
             if candidate_blocks:
