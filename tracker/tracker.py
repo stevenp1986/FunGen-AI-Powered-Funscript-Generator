@@ -4,6 +4,7 @@ import numpy as np
 import time
 from typing import List, Dict, Tuple, Optional, Any
 from ultralytics import YOLO
+import math
 import logging
 import os
 
@@ -1513,7 +1514,6 @@ class ROITracker:
         use_oscillation_area = self.oscillation_area_fixed is not None
         if use_oscillation_area:
             ax, ay, aw, ah = self.oscillation_area_fixed
-            # Crop frame and gray image to oscillation area
             processed_frame = self.preprocess_frame(frame)
             current_gray_full = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY)
             # For detection, crop to area
@@ -1581,8 +1581,9 @@ class ROITracker:
 
         # --- Step 2: Identify Active Cells & Apply VR Focus ---
         # PATCH: Make thresholds inversely proportional to sensitivity
-        min_motion_threshold = 15 / self.oscillation_sensitivity
-        min_cell_activation_pixels = (self.oscillation_block_size**2) * 0.05 / self.oscillation_sensitivity
+        threshold_factor = self.oscillation_sensitivity ** 1.5  # More aggressive scaling
+        min_motion_threshold = 15 / threshold_factor
+        min_cell_activation_pixels = (self.oscillation_block_size**2) * 0.05 / threshold_factor
 
         frame_diff = cv2.absdiff(current_gray, self.prev_gray_oscillation)
         _, motion_mask = cv2.threshold(frame_diff, min_motion_threshold, 255, cv2.THRESH_BINARY)
@@ -1646,7 +1647,7 @@ class ROITracker:
             for motion in block_motions:
                 history = self.oscillation_history.get(motion['pos'])
                 # Only consider blocks with some history and current motion
-                if history and len(history) > 10 and motion['mag'] > (0.2 / self.oscillation_sensitivity):
+                if history and len(history) > 10 and motion['mag'] > (0.2 / threshold_factor):
 
                     # 1. Get stats from history
                     recent_dy = [h['dy'] for h in history]
@@ -1665,7 +1666,7 @@ class ROITracker:
                     # This rewards blocks that are strong, frequent, and non-linear
                     oscillation_score = mean_mag * (1 + frequency_score) * (1 + variance_score)
 
-                    oscillation_score_threshold = 0.5 / self.oscillation_sensitivity  # Lower threshold for higher sensitivity
+                    oscillation_score_threshold = 0.5 / threshold_factor  # Lower threshold for higher sensitivity
 
                     if oscillation_score > oscillation_score_threshold:
                         candidate_blocks.append({'pos': motion['pos'], 'score': oscillation_score, 'dy': motion['dy'], 'dx': motion['dx']})
@@ -1675,17 +1676,27 @@ class ROITracker:
                 # Take any block that has at least 40% of the max score.
                 active_blocks = [b for b in candidate_blocks if b['score'] >= max_score * 0.4]
 
-        # Step 5: Signal Generation
+        # --- Step 5: Fluid Signal Generation using angle and magnitude ---
         if active_blocks:
             total_weight = sum(b['score'] for b in active_blocks)
             if total_weight > 0:
-                # Calculate the raw, unsmoothed position for this frame
-                final_dy = sum(b['dy'] * b['score'] for b in active_blocks) / total_weight
-                final_dx = sum(b['dx'] * b['score'] for b in active_blocks) / total_weight
+                # Weighted sum of dx/dy
+                sum_dx = sum(b['dx'] * b['score'] for b in active_blocks)
+                sum_dy = sum(b['dy'] * b['score'] for b in active_blocks)
+                avg_dx = sum_dx / total_weight
+                avg_dy = sum_dy / total_weight
+
+                # Calculate angle and magnitude
+                final_angle = math.atan2(avg_dy, avg_dx)
+                final_magnitude = np.sqrt(avg_dx**2 + avg_dy**2)
+
+                # Project magnitude onto axes for output
+                projected_dy = final_magnitude * math.sin(final_angle)
+                projected_dx = final_magnitude * math.cos(final_angle)
 
                 max_deviation = 49 * self.oscillation_sensitivity
-                new_raw_primary_pos = 50 + np.clip(final_dy * -10, -max_deviation, max_deviation)
-                new_raw_secondary_pos = 50 + np.clip(final_dx * 10, -max_deviation, max_deviation)
+                new_raw_primary_pos = 50 + np.clip(projected_dy * -10 * self.oscillation_sensitivity, -max_deviation, max_deviation)
+                new_raw_secondary_pos = 50 + np.clip(projected_dx * 10 * self.oscillation_sensitivity, -max_deviation, max_deviation)
 
                 # --- Apply EMA Smoothing Filter ---
                 alpha = self.oscillation_ema_alpha
@@ -1697,18 +1708,15 @@ class ROITracker:
             # This part handles the decay when no motion is detected and has its own smoothing
             time_since_last_active = frame_time_ms - self.oscillation_last_active_time
             if time_since_last_active > self.oscillation_hold_duration_ms:
-                # Decay towards center after hold duration expires.
                 decay_factor = 0.95
                 self.oscillation_last_known_pos = self.oscillation_last_known_pos * decay_factor + 50 * (1 - decay_factor)
                 self.oscillation_last_known_secondary_pos = self.oscillation_last_known_secondary_pos * decay_factor + 50 * (1 - decay_factor)
 
-        # The final funscript position is now based on the smoothed value
         self.oscillation_funscript_pos = int(round(self.oscillation_last_known_pos))
         self.oscillation_funscript_secondary_pos = int(round(self.oscillation_last_known_secondary_pos))
 
-        # Step 6: Action Logging
+        # Step 6: Action Logging (unchanged)
         if self.tracking_active:
-            # This block now correctly saves the generated signal
             current_tracking_axis_mode = self.app.tracking_axis_mode
             current_single_axis_output = self.app.single_axis_output_target
             primary_to_write, secondary_to_write = None, None
@@ -1730,7 +1738,7 @@ class ROITracker:
                                       secondary_pos=secondary_to_write)
             action_log_list.append({"at": frame_time_ms, "pos": primary_to_write, "secondary_pos": secondary_to_write})
 
-        # Step 7: Visualization
+        # Step 7: Visualization (unchanged)
         active_block_positions = {b['pos'] for b in active_blocks}
         for r,c in self.oscillation_cell_persistence.keys():
             x1, y1 = c * self.oscillation_block_size + ax, r * self.oscillation_block_size + ay
