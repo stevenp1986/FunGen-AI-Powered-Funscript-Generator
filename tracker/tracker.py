@@ -1676,36 +1676,26 @@ class ROITracker:
                 # Take any block that has at least 40% of the max score.
                 active_blocks = [b for b in candidate_blocks if b['score'] >= max_score * 0.4]
 
-        # --- Step 5: Fluid Signal Generation using angle and magnitude ---
+        # --- Step 5: Use direction of strongest block and visualize per-block vectors ---
         if active_blocks:
-            total_weight = sum(b['score'] for b in active_blocks)
-            if total_weight > 0:
-                # Weighted sum of dx/dy
-                sum_dx = sum(b['dx'] * b['score'] for b in active_blocks)
-                sum_dy = sum(b['dy'] * b['score'] for b in active_blocks)
-                avg_dx = sum_dx / total_weight
-                avg_dy = sum_dy / total_weight
+            # Find the block with the highest oscillation score
+            best_block = max(active_blocks, key=lambda b: b['score'])
+            angle = math.atan2(best_block['dy'], best_block['dx'])
+            magnitude = np.sqrt(best_block['dx']**2 + best_block['dy']**2)
+            projected_dy = magnitude * math.sin(angle)
+            projected_dx = magnitude * math.cos(angle)
 
-                # Calculate angle and magnitude
-                final_angle = math.atan2(avg_dy, avg_dx)
-                final_magnitude = np.sqrt(avg_dx**2 + avg_dy**2)
+            max_deviation = 49 * self.oscillation_sensitivity
+            new_raw_primary_pos = 50 + np.clip(projected_dy * -10 * self.oscillation_sensitivity, -max_deviation, max_deviation)
+            new_raw_secondary_pos = 50 + np.clip(projected_dx * 10 * self.oscillation_sensitivity, -max_deviation, max_deviation)
 
-                # Project magnitude onto axes for output
-                projected_dy = final_magnitude * math.sin(final_angle)
-                projected_dx = final_magnitude * math.cos(final_angle)
+            # --- Apply EMA Smoothing Filter ---
+            alpha = self.oscillation_ema_alpha
+            self.oscillation_last_known_pos = self.oscillation_last_known_pos * (1 - alpha) + new_raw_primary_pos * alpha
+            self.oscillation_last_known_secondary_pos = self.oscillation_last_known_secondary_pos * (1 - alpha) + new_raw_secondary_pos * alpha
 
-                max_deviation = 49 * self.oscillation_sensitivity
-                new_raw_primary_pos = 50 + np.clip(projected_dy * -10 * self.oscillation_sensitivity, -max_deviation, max_deviation)
-                new_raw_secondary_pos = 50 + np.clip(projected_dx * 10 * self.oscillation_sensitivity, -max_deviation, max_deviation)
-
-                # --- Apply EMA Smoothing Filter ---
-                alpha = self.oscillation_ema_alpha
-                self.oscillation_last_known_pos = self.oscillation_last_known_pos * (1 - alpha) + new_raw_primary_pos * alpha
-                self.oscillation_last_known_secondary_pos = self.oscillation_last_known_secondary_pos * (1 - alpha) + new_raw_secondary_pos * alpha
-
-                self.oscillation_last_active_time = frame_time_ms
+            self.oscillation_last_active_time = frame_time_ms
         else:
-            # This part handles the decay when no motion is detected and has its own smoothing
             time_since_last_active = frame_time_ms - self.oscillation_last_active_time
             if time_since_last_active > self.oscillation_hold_duration_ms:
                 decay_factor = 0.95
@@ -1714,6 +1704,24 @@ class ROITracker:
 
         self.oscillation_funscript_pos = int(round(self.oscillation_last_known_pos))
         self.oscillation_funscript_secondary_pos = int(round(self.oscillation_last_known_secondary_pos))
+
+        # --- Visualization: Draw per-block motion vectors ---
+        for b in active_blocks:
+            r, c = b['pos']
+            # Calculate the center of the block in image coordinates
+            x_center = c * self.oscillation_block_size + ax + self.oscillation_block_size // 2
+            y_center = r * self.oscillation_block_size + ay + self.oscillation_block_size // 2
+            dx_vis = int(b['dx'] * 10)
+            dy_vis = int(b['dy'] * 10)
+            color = (0, 255, 255) if b is best_block else (255, 128, 0)
+            cv2.arrowedLine(
+                processed_frame,
+                (x_center, y_center),
+                (x_center + dx_vis, y_center + dy_vis),
+                color,
+                1,
+                tipLength=0.3
+            )
 
         # Step 6: Action Logging (unchanged)
         if self.tracking_active:
