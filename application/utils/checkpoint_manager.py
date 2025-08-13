@@ -124,6 +124,8 @@ class CheckpointManager:
         
         # Active checkpoints tracking
         self._active_checkpoints: Dict[str, CheckpointData] = {}
+        # Throttling for verbose find logs: {video_path: (last_checkpoint_id, last_log_time)}
+        self._last_find_log: Dict[str, Tuple[str, float]] = {}
         
         logger.info(f"CheckpointManager initialized: dir={checkpoint_dir}, interval={checkpoint_interval}s")
     
@@ -194,7 +196,7 @@ class CheckpointManager:
                 # Cleanup old checkpoints
                 self._cleanup_old_checkpoints(video_path)
                 
-                logger.info(f"Checkpoint created: {checkpoint_id} at {progress_percentage:.1f}%")
+                logger.debug(f"Checkpoint created: {checkpoint_id} at {progress_percentage:.1f}%")
                 return checkpoint_id
                 
             except Exception as e:
@@ -243,7 +245,7 @@ class CheckpointManager:
                     logger.warning(f"Video file missing for checkpoint: {checkpoint_data.video_path}")
                     return None
                 
-                logger.info(f"Checkpoint loaded: {checkpoint_id}")
+                logger.debug(f"Checkpoint loaded: {checkpoint_id}")
                 return checkpoint_data
                 
             except Exception as e:
@@ -287,8 +289,25 @@ class CheckpointManager:
                         latest_checkpoint = checkpoint_data
                 
                 if latest_checkpoint:
-                    logger.info(f"Found latest checkpoint: {latest_checkpoint.checkpoint_id} "
-                              f"at {latest_checkpoint.progress_percentage:.1f}%")
+                    # Throttle INFO spam: only log when checkpoint ID changes or every 30s
+                    now = time.time()
+                    last = self._last_find_log.get(video_path)
+                    should_info_log = (
+                        last is None or
+                        last[0] != latest_checkpoint.checkpoint_id or
+                        (now - last[1]) > 30.0
+                    )
+                    if should_info_log:
+                        logger.info(
+                            f"Found latest checkpoint: {latest_checkpoint.checkpoint_id} "
+                            f"at {latest_checkpoint.progress_percentage:.1f}%"
+                        )
+                        self._last_find_log[video_path] = (latest_checkpoint.checkpoint_id, now)
+                    else:
+                        logger.debug(
+                            f"Found latest checkpoint (suppressed): {latest_checkpoint.checkpoint_id} "
+                            f"at {latest_checkpoint.progress_percentage:.1f}%"
+                        )
                 
                 return latest_checkpoint
                 

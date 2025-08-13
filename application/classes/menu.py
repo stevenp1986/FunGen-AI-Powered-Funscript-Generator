@@ -581,6 +581,20 @@ class MainMenu:
                     "calculate the optimal time offset."
                 )
 
+            if _menu_item_simple("Reload Plugin Filters"):
+                # Reload plugins for all interactive timelines
+                timeline1 = getattr(app, "interactive_funscript_timeline1", None)
+                timeline2 = getattr(app, "interactive_funscript_timeline2", None)
+                if timeline1:
+                    timeline1._reload_plugins()
+                if timeline2:
+                    timeline2._reload_plugins()
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(
+                    "Reload funscript filter plugins from the plugins directories. "
+                    "Use this after adding new plugin files."
+                )
+
             if not hasattr(app, "tensorrt_compiler_window"):
                 app.tensorrt_compiler_window = None
 
@@ -625,7 +639,6 @@ class MainMenu:
             for key, label, default in (
                 ("updater_check_on_startup", "Check for Updates on Startup", True),
                 ("updater_check_periodically", "Check Periodically in Background (Hourly)", True),  # noqa: E501
-                ("updater_suppress_popup", "Suppress Update Notification Popup", False),
             ):
                 cur = settings.get(key, default)
                 clicked, new_val = imgui.menu_item(label, selected=cur)

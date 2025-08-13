@@ -34,12 +34,17 @@ class GUI:
         self.funscript_preview_texture_id = 0
 
         # --- Advanced Threading Architecture ---
-        # Legacy preview threading (keep for now for compatibility)
-        self.preview_task_queue = queue.Queue()
-        self.preview_results_queue = queue.Queue()
+        # Decoupled, non-blocking preview/heatmap pipeline with larger queues and background workers
+        max_queue = 8
+        self.preview_task_queue = queue.Queue(maxsize=max_queue)
+        self.preview_results_queue = queue.Queue(maxsize=max_queue)
         self.shutdown_event = threading.Event()
-        self.preview_worker_thread = threading.Thread(target=self._preview_generation_worker, daemon=True)
-        self.preview_worker_thread.start()
+        # Start 2 workers to avoid stalls under load
+        self.preview_worker_threads = [
+            threading.Thread(target=self._preview_generation_worker, daemon=True, name="PreviewWorker-1"),
+            threading.Thread(target=self._preview_generation_worker, daemon=True, name="PreviewWorker-2")
+        ]
+        for t in self.preview_worker_threads: t.start()
         
         # New ProcessingThreadManager for GPU-intensive operations
         self.processing_thread_manager = ProcessingThreadManager(
@@ -102,7 +107,7 @@ class GUI:
 
         self.last_preview_update_time_timeline = 0.0
         self.last_preview_update_time_heatmap = 0.0
-        self.preview_update_interval_seconds = 1.0
+        self.preview_update_interval_seconds = constants.UI_PREVIEW_UPDATE_INTERVAL_S
 
         self.last_mouse_pos_for_energy_saver = (0, 0)
         self.app.energy_saver.reset_activity_timer()
@@ -129,7 +134,7 @@ class GUI:
         """
         while not self.shutdown_event.is_set():
             try:
-                task = self.preview_task_queue.get(timeout=1)
+                task = self.preview_task_queue.get(timeout=0.1)
                 task_type = task['type']
 
                 if task_type == 'timeline':
@@ -329,28 +334,20 @@ class GUI:
         else:
             # --- Detailed, Speed-Colored Line Drawing (Original Logic) ---
             if len(actions) > 1:
-                for i in range(len(actions) - 1):
-                    p1_action, p2_action = actions[i], actions[i + 1]
-                    time1_s, pos1_norm = p1_action["at"] / 1000.0, p1_action["pos"] / 100.0
-                    px1, py1 = int(round((time1_s / total_duration_s) * target_width)), int(
-                        round((1.0 - pos1_norm) * target_height))
-                    time2_s, pos2_norm = p2_action["at"] / 1000.0, p2_action["pos"] / 100.0
-                    px2, py2 = int(round((time2_s / total_duration_s) * target_width)), int(
-                        round((1.0 - pos2_norm) * target_height))
-
-                    px1, py1 = np.clip(px1, 0, target_width - 1), np.clip(py1, 0, target_height - 1)
-                    px2, py2 = np.clip(px2, 0, target_width - 1), np.clip(py2, 0, target_height - 1)
-                    if px1 == px2 and py1 == py2: continue
-
-                    delta_pos = abs(p2_action["pos"] - p1_action["pos"])
-                    delta_time_ms = p2_action["at"] - p1_action["at"]
-                    speed_pps = delta_pos / (delta_time_ms / 1000.0) if delta_time_ms > 0 else 0.0
-                    segment_color_float_rgba = self.app.utility.get_speed_color_from_map(speed_pps)
-                    segment_color_cv_bgra = (
-                        int(segment_color_float_rgba[2] * 255), int(segment_color_float_rgba[1] * 255),
-                        int(segment_color_float_rgba[0] * 255), int(segment_color_float_rgba[3] * 255)
-                    )
-                    cv2.line(image_data, (px1, py1), (px2, py2), segment_color_cv_bgra, thickness=1)
+                ats = np.array([a['at'] for a in actions], dtype=np.float64) / 1000.0
+                pos = np.array([a['pos'] for a in actions], dtype=np.float32) / 100.0
+                x = np.clip(((ats / total_duration_s) * (target_width - 1)).astype(np.int32), 0, target_width - 1)
+                y = np.clip(((1.0 - pos) * target_height).astype(np.int32), 0, target_height - 1)
+                dt = np.diff(ats)
+                dpos = np.abs(np.diff(pos * 100.0))  # back to 0..100 for speed calc
+                speeds = np.divide(dpos, dt, out=np.zeros_like(dpos), where=dt > 1e-6)
+                colors_u8 = self.app.utility.get_speed_colors_vectorized_u8(speeds)  # RGBA uint8
+                # Draw per segment; allow OpenCV to optimize internally
+                for i in range(len(speeds)):
+                    if x[i] == x[i+1] and y[i] == y[i+1]:
+                        continue
+                    c = colors_u8[i]
+                    cv2.line(image_data, (int(x[i]), int(y[i])), (int(x[i+1]), int(y[i+1])), (int(c[2]), int(c[1]), int(c[0]), int(c[3])), 1)
 
         return image_data
 
@@ -365,26 +362,35 @@ class GUI:
         image_data = np.full((target_height, target_width, 4), (colors.HEATMAP_BACKGROUND), dtype=np.uint8)
 
         if len(actions) > 1 and total_duration_s > 0.001:
-            for i in range(len(actions) - 1):
-                p1, p2 = actions[i], actions[i + 1]
-                start_time_s, end_time_s = p1["at"] / 1000.0, p2["at"] / 1000.0
-                if end_time_s <= start_time_s: continue
-                seg_start_x_px = int(round((start_time_s / total_duration_s) * target_width))
-                seg_end_x_px = int(round((end_time_s / total_duration_s) * target_width))
-                seg_start_x_px, seg_end_x_px = max(0, seg_start_x_px), min(target_width, seg_end_x_px)
-
-                if seg_end_x_px <= seg_start_x_px:
-                    if seg_start_x_px < target_width:
-                        seg_end_x_px = seg_start_x_px + 1
-                    else:
-                        continue
-
-                delta_pos = abs(p2["pos"] - p1["pos"])
-                delta_time_s_seg = (p2["at"] - p1["at"]) / 1000.0
-                speed_pps = delta_pos / delta_time_s_seg if delta_time_s_seg > 0.001 else 0.0
-                segment_color_float_rgba = self.app.utility.get_speed_color_from_map(speed_pps)
-                segment_color_byte_rgba = np.array([int(c * 255) for c in segment_color_float_rgba], dtype=np.uint8)
-                image_data[:, seg_start_x_px:seg_end_x_px] = segment_color_byte_rgba
+            ats = np.array([a['at'] for a in actions], dtype=np.float64) / 1000.0
+            poss = np.array([a['pos'] for a in actions], dtype=np.float32)
+            # Segment starts/ends in pixel space
+            x_coords = ((ats / total_duration_s) * (target_width - 1)).astype(np.int32)
+            x_coords = np.clip(x_coords, 0, target_width - 1)
+            # Compute speeds per segment
+            dt = np.diff(ats)
+            dpos = np.abs(np.diff(poss))
+            speeds = np.divide(dpos, dt, out=np.zeros_like(dpos), where=dt > 1e-6)
+            # Vectorized color mapping (prebuilt cache to uint8)
+            colors_u8 = self.app.utility.get_speed_colors_vectorized_u8(speeds)
+            # For each column, find its segment index via searchsorted
+            cols = np.arange(target_width, dtype=np.int32)
+            # Map columns to times then to segment indices
+            # In pixel domain we can use x_coords boundaries directly
+            seg_idx_for_col = np.searchsorted(x_coords, cols, side='right') - 1
+            # Columns before first segment are not-yet-fixed; set fully transparent (alpha=0)
+            valid_mask = seg_idx_for_col >= 0
+            seg_idx_for_col = np.clip(seg_idx_for_col, 0, len(speeds) - 1)
+            col_colors = np.zeros((target_width, 4), dtype=np.uint8)
+            if np.any(valid_mask):
+                col_colors[valid_mask] = colors_u8[seg_idx_for_col[valid_mask]]  # shape (W,4)
+                # Ensure fully opaque for fixed columns
+                col_colors[valid_mask, 3] = 255
+            # Ensure not-yet-fixed columns remain fully transparent
+            if np.any(~valid_mask):
+                col_colors[~valid_mask, 3] = 0
+            # Broadcast to image rows
+            image_data[:] = col_colors[np.newaxis, :, :]
 
         return image_data
 
@@ -561,15 +567,25 @@ class GUI:
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id)
 
+        # Cache last texture sizes to prefer glTexSubImage2D when dimensions unchanged
+        if not hasattr(self, '_texture_sizes'):
+            self._texture_sizes = {}
+
+        last_size = self._texture_sizes.get(texture_id)
+
         # Determine format and upload
         if len(image.shape) == 2:
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RED, w, h, 0, gl.GL_RED, gl.GL_UNSIGNED_BYTE, image)
+            internal_fmt = gl.GL_RED; fmt = gl.GL_RED; payload = image
         elif image.shape[2] == 3:
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, w, h, 0, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, rgb_image)
-        elif image.shape[2] == 4:
-            # The worker already produces RGBA, no conversion needed
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, image)
+            internal_fmt = gl.GL_RGB; fmt = gl.GL_RGB; payload = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            internal_fmt = gl.GL_RGBA; fmt = gl.GL_RGBA; payload = image
+
+        if last_size and last_size == (w, h, internal_fmt):
+            gl.glTexSubImage2D(gl.GL_TEXTURE_2D, 0, 0, 0, w, h, fmt, gl.GL_UNSIGNED_BYTE, payload)
+        else:
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, internal_fmt, w, h, 0, fmt, gl.GL_UNSIGNED_BYTE, payload)
+            self._texture_sizes[texture_id] = (w, h, internal_fmt)
 
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
@@ -628,7 +644,8 @@ class GUI:
             and (not is_live_tracking
             or (time.time() - self.last_preview_update_time_timeline >= self.preview_update_interval_seconds))))
 
-        if needs_regen and self.preview_task_queue.empty():
+        # Non-blocking submit: try_put; if queue full, skip this frame without blocking UI
+        if needs_regen:
             actions_copy = self.app.funscript_processor.get_actions('primary').copy()
             task = {
                 'type': 'timeline',
@@ -637,7 +654,10 @@ class GUI:
                 'total_duration_s': total_duration_s,
                 'actions': actions_copy
             }
-            self.preview_task_queue.put(task)
+            try:
+                self.preview_task_queue.put_nowait(task)
+            except queue.Full:
+                pass
 
             # Update state after submission
             app_state.funscript_preview_dirty = False
@@ -723,7 +743,7 @@ class GUI:
 
         needs_regen = full_redraw_needed or (incremental_update_needed and (not is_live_tracking or (time.time() - self.last_preview_update_time_heatmap >= self.preview_update_interval_seconds)))
 
-        if needs_regen and self.preview_task_queue.empty():
+        if needs_regen:
             actions_copy = self.app.funscript_processor.get_actions('primary').copy()
             task = {
                 'type': 'heatmap',
@@ -732,7 +752,10 @@ class GUI:
                 'total_duration_s': total_video_duration_s,
                 'actions': actions_copy
             }
-            self.preview_task_queue.put(task)
+            try:
+                self.preview_task_queue.put_nowait(task)
+            except queue.Full:
+                pass
 
             # Update state after submission
             app_state.heatmap_dirty = False
@@ -894,8 +917,7 @@ class GUI:
             or io.want_text_input
             or imgui.is_mouse_dragging(0)
             or imgui.is_any_item_active()
-            or imgui.is_any_item_focused()
-            or (self.file_dialog and self.file_dialog.open)):
+            or imgui.is_any_item_focused()):
                 interaction_detected_this_frame = True
         if hasattr(io, 'keys_down'):
             for i in range(len(io.keys_down)):
@@ -1296,15 +1318,22 @@ class GUI:
                 gl.glClearColor(*colors.BACKGROUND_CLEAR)
                 gl.glClear(gl.GL_COLOR_BUFFER_BIT)
                 self.render_gui()
-                if self.app.app_settings.get("autosave_enabled", True) and time.time() - self.app.project_manager.last_autosave_time > self.app.app_settings.get("autosave_interval_seconds", 300):
+                if (
+                    self.app.app_settings.get("autosave_enabled", True)
+                    and time.time() - self.app.project_manager.last_autosave_time > self.app.app_settings.get("autosave_interval_seconds", constants.DEFAULT_AUTOSAVE_INTERVAL_SECONDS)
+                ):
                     self.app.project_manager.perform_autosave()
                 self.app.energy_saver.check_and_update_energy_saver()
                 glfw.swap_buffers(self.window)
                 current_target_duration = target_frame_duration_energy_saver if self.app.energy_saver.energy_saver_active else target_frame_duration_normal
                 elapsed_time_for_frame = time.time() - frame_start_time
                 sleep_duration = current_target_duration - elapsed_time_for_frame
-                # Periodic update checks
-                if self.app.app_settings.get("updater_check_periodically", True) and time.time() - self.app.updater.last_check_time > 3600:  # 1 hour
+                
+                if ( # Periodic update checks
+                    self.app.app_settings.get("updater_check_on_startup", True)
+                    and self.app.app_settings.get("updater_check_periodically", True)
+                    and time.time() - self.app.updater.last_check_time > 3600  # 1 hour
+                ):
                     self.app.updater.check_for_updates_async()
                 if sleep_duration > 0:
                     time.sleep(sleep_duration)
@@ -1319,11 +1348,13 @@ class GUI:
             self.processing_thread_manager.shutdown(timeout=3.0)
             
             # Shutdown legacy preview worker thread
-            try:
-                self.preview_task_queue.put_nowait({'type': 'shutdown'})
-            except queue.Full:
-                pass
-            self.preview_worker_thread.join()
+            for _ in self.preview_worker_threads:
+                try:
+                    self.preview_task_queue.put_nowait({'type': 'shutdown'})
+                except queue.Full:
+                    pass
+            for t in self.preview_worker_threads:
+                t.join()
 
             if self.frame_texture_id: gl.glDeleteTextures([self.frame_texture_id]); self.frame_texture_id = 0
             if self.heatmap_texture_id: gl.glDeleteTextures([self.heatmap_texture_id]); self.heatmap_texture_id = 0

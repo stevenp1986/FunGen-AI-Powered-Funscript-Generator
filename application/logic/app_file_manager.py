@@ -197,6 +197,8 @@ class AppFileManager:
                                               extra={'status_message': True})
                     if funscript_processor.video_chapters:
                         funscript_processor.video_chapters.sort(key=lambda s: s.start_frame_id)
+                        # Sync loaded chapters to funscript object
+                        funscript_processor._sync_chapters_to_funscript()
                         self.logger.info(
                             f"Loaded {len(funscript_processor.video_chapters)} chapters from {os.path.basename(funscript_file_path)} using FPS {fps_for_conversion:.2f}.")
             self.app.app_state_ui.heatmap_dirty = True
@@ -410,6 +412,11 @@ class AppFileManager:
             potential_s2_overlay = self.get_output_path_for_file(self.video_path, "_stage2_overlay.msgpack")
             if os.path.exists(potential_s2_overlay):
                 self.load_stage2_overlay_data(potential_s2_overlay)
+            
+            # Auto-load Stage 3 mixed debug data if it exists
+            potential_s3_mixed_debug = self.get_output_path_for_file(self.video_path, "_stage3_mixed_debug.msgpack")
+            if os.path.exists(potential_s3_mixed_debug):
+                self.load_stage3_mixed_debug_data(potential_s3_mixed_debug)
 
         # This part runs for both project loads and new projects.
         if self.app.processor:
@@ -428,16 +435,25 @@ class AppFileManager:
                     if funscript_to_load:
                         self.load_funscript_to_timeline(funscript_to_load, timeline_num=1)
 
-    def close_video_action(self, clear_funscript_unconditionally=False):
+    def close_video_action(self, clear_funscript_unconditionally=False, skip_tracker_reset=False):
         if self.app.processor:
-            if self.app.processor.is_processing: self.app.processor.stop_processing()
-            self.app.processor.reset(close_video=True)  # Resets video info in processor
+            if self.app.processor.is_processing:
+                self.app.processor.stop_processing()
+            try:
+                self.app.processor.reset(close_video=True, skip_tracker_reset=skip_tracker_reset)  # Resets video info in processor
+            except TypeError:
+                self.app.processor.reset(close_video=True)
 
         self.video_path = ""
         self.preprocessed_video_path = None
         self.app.stage_processor.reset_stage_status(stages=("stage1", "stage2", "stage3"))
         self.app.funscript_processor.video_chapters.clear()
         self.clear_stage2_overlay_data()
+        # Also clear any mixed debug artifacts
+        if hasattr(self.app, 'stage3_mixed_debug_data'):
+            self.app.stage3_mixed_debug_data = None
+        if hasattr(self.app, 'stage3_mixed_debug_frame_map'):
+            self.app.stage3_mixed_debug_frame_map = None
 
         # Clear audio waveform data
         self.app.audio_waveform_data = None
@@ -465,6 +481,7 @@ class AppFileManager:
         self.app.project_manager.project_dirty = True
 
     def load_stage2_overlay_data(self, filepath: str):
+        """Load Stage 2 overlay data (supports legacy list format and new dict with frames/segments/metadata)."""
         self.clear_stage2_overlay_data()  # Clear previous before loading new
         stage_processor = self.app.stage_processor
         try:
@@ -472,34 +489,50 @@ class AppFileManager:
                 packed_data = f.read()
             loaded_data = msgpack.unpackb(packed_data, raw=False)
 
-            if isinstance(loaded_data, list):
-                stage_processor.stage2_overlay_data = loaded_data
-                # Create a map for quick lookup by frame_id
-                stage_processor.stage2_overlay_data_map = {
-                    frame_data.get("frame_id", -1): frame_data
-                    for frame_data in stage_processor.stage2_overlay_data if isinstance(frame_data, dict)
-                }
-                self.stage2_output_msgpack_path = filepath  # Store path of loaded overlay
+            overlay_frames: list = []
+            overlay_segments: list = []
 
-                if loaded_data:
-                    stage_processor.stage2_status_text = f"Overlay loaded: {os.path.basename(filepath)}"
-                    # stage_processor.stage2_progress_value = 1.0 # No, this is for S2 run
-                    # stage_processor.stage2_progress_label = f"{len(stage_processor.stage2_overlay_data)} frames"
-                    self.logger.info(
-                        f"Loaded Stage 2 overlay: {os.path.basename(filepath)} ({len(stage_processor.stage2_overlay_data)} frames)",
-                        extra={'status_message': True})
-                    self.app.app_state_ui.show_stage2_overlay = True
-                else:
-                    stage_processor.stage2_status_text = f"Overlay file empty: {os.path.basename(filepath)}"
-                    self.app.app_state_ui.show_stage2_overlay = False
-                    self.logger.warning(f"Stage 2 overlay file is empty: {os.path.basename(filepath)}", extra={'status_message': True})
-
-                self.app.project_manager.project_dirty = True
-                self.app.energy_saver.reset_activity_timer()
+            # New format: { "frames": [...], "segments": [...], "metadata": {...} }
+            if isinstance(loaded_data, dict) and ("frames" in loaded_data or "segments" in loaded_data):
+                overlay_frames = loaded_data.get("frames", []) or []
+                overlay_segments = loaded_data.get("segments", []) or []
+            # Legacy format: list of frame dicts
+            elif isinstance(loaded_data, list):
+                overlay_frames = loaded_data
             else:
-                stage_processor.stage2_status_text = "Error: Overlay not list format"
+                stage_processor.stage2_status_text = "Error: Unsupported overlay format"
                 self.app.app_state_ui.show_stage2_overlay = False
-                self.logger.error("Stage 2 overlay data is not in expected list format.", extra={'status_message': True})
+                self.logger.error("Stage 2 overlay data is not in expected dict/list format.")
+                return
+
+            # Set overlay frames into processor structures
+            stage_processor.stage2_overlay_data = overlay_frames
+            stage_processor.stage2_overlay_data_map = {
+                frame_data.get("frame_id", -1): frame_data
+                for frame_data in overlay_frames if isinstance(frame_data, dict)
+            }
+            self.stage2_output_msgpack_path = filepath
+
+            # Load segments if present
+            if overlay_segments:
+                try:
+                    self.app.stage2_segments = [VideoSegment.from_dict(seg) if isinstance(seg, dict) else seg for seg in overlay_segments]
+                except Exception as seg_e:
+                    self.logger.warning(f"Failed to parse overlay segments: {seg_e}")
+
+            if overlay_frames:
+                stage_processor.stage2_status_text = f"Overlay loaded: {os.path.basename(filepath)}"
+                self.logger.info(
+                    f"Loaded Stage 2 overlay: {os.path.basename(filepath)} ({len(overlay_frames)} frames)",
+                    extra={'status_message': True})
+                self.app.app_state_ui.show_stage2_overlay = True
+            else:
+                stage_processor.stage2_status_text = f"Overlay file empty: {os.path.basename(filepath)}"
+                self.app.app_state_ui.show_stage2_overlay = False
+                self.logger.warning(f"Stage 2 overlay file is empty: {os.path.basename(filepath)}", extra={'status_message': True})
+
+            self.app.project_manager.project_dirty = True
+            self.app.energy_saver.reset_activity_timer()
         except Exception as e:
             stage_processor.stage2_status_text = "Error loading overlay"
             self.app.app_state_ui.show_stage2_overlay = False
@@ -510,6 +543,45 @@ class AppFileManager:
         stage_processor.stage2_overlay_data = None
         stage_processor.stage2_overlay_data_map = None
         self.stage2_output_msgpack_path = None  # Clear path if data is cleared
+
+    def load_stage3_mixed_debug_data(self, filepath: str):
+        """Load Stage 3 mixed debug msgpack for overlay display during video playback."""
+        self.clear_stage3_mixed_debug_data()
+        try:
+            with open(filepath, 'rb') as f:
+                packed_data = f.read()
+            loaded_data = msgpack.unpackb(packed_data, raw=False)
+            
+            if isinstance(loaded_data, dict) and 'frame_data' in loaded_data:
+                # Store the loaded debug data
+                self.app.stage3_mixed_debug_data = loaded_data
+                self.app.stage3_mixed_debug_frame_map = {}
+                
+                # Create frame map for quick lookup
+                for frame_id_str, frame_debug in loaded_data['frame_data'].items():
+                    try:
+                        frame_id = int(frame_id_str)
+                        self.app.stage3_mixed_debug_frame_map[frame_id] = frame_debug
+                    except (ValueError, TypeError):
+                        continue
+                
+                frame_count = len(self.app.stage3_mixed_debug_frame_map)
+                self.logger.info(f"Loaded Stage 3 mixed debug data: {os.path.basename(filepath)} ({frame_count} frames)")
+                return True
+            else:
+                self.logger.error("Stage 3 mixed debug data is not in expected format.")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error loading Stage 3 mixed debug msgpack '{filepath}': {e}")
+            return False
+    
+    def clear_stage3_mixed_debug_data(self):
+        """Clear Stage 3 mixed debug data."""
+        if hasattr(self.app, 'stage3_mixed_debug_data'):
+            self.app.stage3_mixed_debug_data = None
+        if hasattr(self.app, 'stage3_mixed_debug_frame_map'):
+            self.app.stage3_mixed_debug_frame_map = None
 
     def open_video_from_path(self, file_path: str) -> bool:
         """

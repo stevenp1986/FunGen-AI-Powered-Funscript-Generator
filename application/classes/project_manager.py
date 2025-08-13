@@ -139,9 +139,21 @@ class ProjectManager:
                         f"Video file specified in project not found: {self.app.file_manager.video_path}")
                 self.app.file_manager.video_path = ""  # Ensure video_path is cleared if not valid
 
-            # On successful load, update the recent projects list
-            self._add_to_recent_projects(filepath)
-            self.app.app_settings.set("last_opened_project_path", os.path.abspath(filepath))
+            # On successful load, update the recent projects list and last opened path in one save
+            abs_filepath = os.path.abspath(filepath)
+            
+            # Update recent projects list
+            recent_list = self.app.app_settings.get("recent_projects", [])
+            if abs_filepath in recent_list:
+                recent_list.remove(abs_filepath)
+            recent_list.insert(0, abs_filepath)
+            trimmed_list = recent_list[:10]  # Trim to max 10 recent files
+            
+            # Batch update both settings in one save
+            self.app.app_settings.set_batch(
+                recent_projects=trimmed_list,
+                last_opened_project_path=abs_filepath
+            )
 
             self.project_file_path = filepath
 
@@ -266,6 +278,7 @@ class ProjectManager:
             "loaded_funscript_path_timeline1": self.app.file_manager.loaded_funscript_path,  # T1 specific
             "stage1_output_msgpack_path": stage_proc_data.get("stage1_output_msgpack_path"),
             "stage2_overlay_msgpack_path": stage_proc_data.get("stage2_overlay_msgpack_path"),
+            "stage2_database_path": stage_proc_data.get("stage2_database_path"),
 
             # Funscript Data
             "funscript_actions_timeline1": primary_actions,
@@ -324,6 +337,14 @@ class ProjectManager:
         fm.loaded_funscript_path = project_data.get("loaded_funscript_path_timeline1", fm.funscript_path)
         fm.stage1_output_msgpack_path = project_data.get("stage1_output_msgpack_path")
         fm.stage2_output_msgpack_path = project_data.get("stage2_overlay_msgpack_path")  # Path to overlay
+        
+        # Load Stage 2 database path and set it in the app
+        stage2_db_path = project_data.get("stage2_database_path")
+        if stage2_db_path and os.path.exists(stage2_db_path):
+            self.app.s2_sqlite_db_path = stage2_db_path
+            self.app.logger.info(f"Loaded Stage 2 database path from project: {stage2_db_path}")
+        else:
+            self.app.s2_sqlite_db_path = None
 
         # Data for FunscriptProcessor
         fs_proc = self.app.funscript_processor
