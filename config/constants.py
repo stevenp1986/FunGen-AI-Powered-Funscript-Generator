@@ -88,6 +88,7 @@ class TrackerMode(Enum):
     OFFLINE_2_STAGE = "Offline - YOLO AI (2 Stages)"                            # 4
     OFFLINE_3_STAGE = "Offline - YOLO AI + Opt. Flow (3 Stages)"                # 5 
     OFFLINE_3_STAGE_MIXED = "Offline - YOLO AI + Mixed Flow (3 Stages Mixed)"   # 6
+    DOT_TRACKER = "Live - Dot Tracker (Manual point)"                            # 7
 
 DEFAULT_TRACKER_MODE = 0
 

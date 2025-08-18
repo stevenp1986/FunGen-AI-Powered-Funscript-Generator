@@ -311,6 +311,7 @@ class ControlPanelUI:
             self.TrackerMode.LIVE_USER_ROI,
             self.TrackerMode.OSCILLATION_DETECTOR,
             self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
+            getattr(self.TrackerMode, 'DOT_TRACKER', None),
         )
         is_playback_active = processor and processor.is_processing and not processor.enable_tracker_processing
 
@@ -356,6 +357,7 @@ class ControlPanelUI:
             tracker_mode.OSCILLATION_DETECTOR_LEGACY,
             tracker_mode.LIVE_YOLO_ROI,
             tracker_mode.LIVE_USER_ROI,
+            getattr(tracker_mode, 'DOT_TRACKER', None),
             tracker_mode.OFFLINE_2_STAGE,
             tracker_mode.OFFLINE_3_STAGE,
             tracker_mode.OFFLINE_3_STAGE_MIXED,
@@ -366,7 +368,7 @@ class ControlPanelUI:
             flags=imgui.TREE_NODE_DEFAULT_OPEN,
         )
         if open_:
-            modes_display = [m.value for m in modes_enum]
+            modes_display = [m.value for m in modes_enum if m is not None]
 
             processor = app.processor
             disable_combo = (
@@ -375,11 +377,13 @@ class ControlPanelUI:
                 or (processor and processor.is_processing and not processor.pause_event.is_set())
             )
             with _DisabledScope(disable_combo):
+                # Rebuild filtered list to avoid None entries if DOT_TRACKER doesn't exist
+                filtered_modes_enum = [m for m in modes_enum if m is not None]
                 try:
-                    cur_idx = modes_enum.index(app_state.selected_tracker_mode)
+                    cur_idx = filtered_modes_enum.index(app_state.selected_tracker_mode)
                 except ValueError:
                     cur_idx = 0
-                    app_state.selected_tracker_mode = modes_enum[cur_idx]
+                    app_state.selected_tracker_mode = filtered_modes_enum[cur_idx]
 
                 clicked, new_idx = imgui.combo("##TrackerModeCombo", cur_idx, modes_display)
                 self._help_tooltip(
@@ -393,7 +397,7 @@ class ControlPanelUI:
                 )
 
             if clicked and new_idx != cur_idx:
-                new_mode = modes_enum[new_idx]
+                new_mode = filtered_modes_enum[new_idx]
                 # Clear all overlays when switching to a different mode
                 if app_state.selected_tracker_mode != new_mode:
                     if hasattr(app, 'logger') and app.logger:
@@ -408,10 +412,12 @@ class ControlPanelUI:
                         tracker_mode.OSCILLATION_DETECTOR_LEGACY,
                         tracker_mode.LIVE_YOLO_ROI,
                         tracker_mode.LIVE_USER_ROI,
+                        getattr(tracker_mode, 'DOT_TRACKER', None),
                         tracker_mode.OFFLINE_2_STAGE,
                         tracker_mode.OFFLINE_3_STAGE,
                         tracker_mode.OFFLINE_3_STAGE_MIXED,
                     ]
+                    all_modes = [m for m in all_modes if m is not None]
                     try:
                         idx_to_store = all_modes.index(new_mode)
                     except ValueError:
@@ -425,6 +431,8 @@ class ControlPanelUI:
                         tr.set_tracking_mode("OSCILLATION_DETECTOR")
                     elif new_mode == tracker_mode.OSCILLATION_DETECTOR_LEGACY:
                         tr.set_tracking_mode("OSCILLATION_DETECTOR_LEGACY")
+                    elif getattr(tracker_mode, 'DOT_TRACKER', None) and new_mode == tracker_mode.DOT_TRACKER:
+                        tr.set_tracking_mode("DOT_TRACKER")
                     else:
                         tr.set_tracking_mode("YOLO_ROI")
 
@@ -1276,7 +1284,13 @@ class ControlPanelUI:
             if selected_mode in [self.TrackerMode.OFFLINE_3_STAGE, self.TrackerMode.OFFLINE_3_STAGE_MIXED, self.TrackerMode.OFFLINE_2_STAGE]:
                 start_text = "Start AI Analysis (Range)" if fs_proc.scripting_range_active else "Start Full AI Analysis"
                 handler = event_handlers.handle_start_ai_cv_analysis
-            elif selected_mode in [self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY]:
+            elif selected_mode in [
+                self.TrackerMode.LIVE_YOLO_ROI,
+                self.TrackerMode.LIVE_USER_ROI,
+                self.TrackerMode.OSCILLATION_DETECTOR,
+                self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
+                getattr(self.TrackerMode, 'DOT_TRACKER', None),
+            ]:
                 imgui.new_line()
                 start_text = "Start Live Tracking (Range)" if fs_proc.scripting_range_active else "Start Live Tracking"
                 handler = event_handlers.handle_start_live_tracker_click
@@ -1307,7 +1321,13 @@ class ControlPanelUI:
             else:
                 # Normal start button
                 if imgui.button(start_text, width=button_width):
-                    if selected_mode in [self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY]:
+                    if selected_mode in [
+                        self.TrackerMode.LIVE_YOLO_ROI,
+                        self.TrackerMode.LIVE_USER_ROI,
+                        self.TrackerMode.OSCILLATION_DETECTOR,
+                        self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
+                        getattr(self.TrackerMode, 'DOT_TRACKER', None),
+                    ]:
                         self._start_live_tracking()
                     elif handler: handler()
 
@@ -1321,7 +1341,13 @@ class ControlPanelUI:
             imgui.pop_style_var()
             imgui.internal.pop_item_flag()
         # Place info note for live methods directly below the buttons
-        if selected_mode in [self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY]:
+        if selected_mode in [
+            self.TrackerMode.LIVE_YOLO_ROI,
+            self.TrackerMode.LIVE_USER_ROI,
+            self.TrackerMode.OSCILLATION_DETECTOR,
+            self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
+            getattr(self.TrackerMode, 'DOT_TRACKER', None),
+        ]:
             imgui.text_ansi_colored("It can take up to 35 seconds to see output on the timelines.\nThis is a known feature.", 0.25, 0.88, 0.82)
 
     def _render_stage_progress_ui(self, stage_proc):

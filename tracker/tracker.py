@@ -522,7 +522,7 @@ class ROITracker:
         return overall_dy, overall_dx, lower_magnitude, upper_magnitude, flow
 
     def set_tracking_mode(self, mode: str):
-        if mode in ["YOLO_ROI", "USER_FIXED_ROI", "OSCILLATION_DETECTOR", "OSCILLATION_DETECTOR_LEGACY"]:
+        if mode in ["YOLO_ROI", "USER_FIXED_ROI", "OSCILLATION_DETECTOR", "OSCILLATION_DETECTOR_LEGACY", "DOT_TRACKER"]:
             if self.tracking_mode != mode:
                 previous_mode = self.tracking_mode
                 # Before switching, update caches from current state

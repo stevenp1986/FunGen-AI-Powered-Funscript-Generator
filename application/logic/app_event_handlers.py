@@ -134,6 +134,8 @@ class AppEventHandlers:
             self.app.tracker.set_tracking_mode("OSCILLATION_DETECTOR_LEGACY")
         elif selected_mode_from_ui == TrackerMode.LIVE_YOLO_ROI:
             self.app.tracker.set_tracking_mode("YOLO_ROI")
+        elif selected_mode_from_ui == TrackerMode.DOT_TRACKER:
+            self.app.tracker.set_tracking_mode("DOT_TRACKER")
 
         current_tracker_mode = self.app.tracker.tracking_mode
 
@@ -168,6 +170,8 @@ class AppEventHandlers:
             self.logger.info("Starting Live Tracker (2D Oscillation Detector mode).")
         elif current_tracker_mode == "OSCILLATION_DETECTOR_LEGACY":
             self.logger.info("Starting Live Tracker (2D Oscillation Detector Legacy mode).")
+        elif current_tracker_mode == "DOT_TRACKER":
+            self.logger.info("Starting Live Tracker (Dot Tracker mode).")
         
         else:
             self.logger.error(f"Unknown tracker mode for live start: {current_tracker_mode}");
