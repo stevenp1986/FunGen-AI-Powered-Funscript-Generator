@@ -233,7 +233,12 @@ class ROITracker:
         self.current_fps: float = 0.0
         self.current_effective_amp_factor: float = self.base_amplification_factor
         self.stats_display: List[str] = []
-        self.logger.info(f"Tracker fully initialized (ROI Persistence: {self.max_frames_for_roi_persistence} frames, ROI Smoothing: {self.roi_smoothing_factor}). App instance {'provided' if self.app else 'not provided (e.g. S3 mode)'}.")
+        # Omni-axis tracking state (projects 2D motion to a single axis)
+        self.omni_axis_unit = np.array([0.0, 1.0], dtype=float)  # default vertical
+        self.omni_axis_alpha = 0.2  # smoothing for dominant direction
+        self.omni_last_known_pos: float = 50.0
+        self.omni_funscript_pos: int = 50
+        self.logger.info(f"Tracker fully initialized (ROI Persistence: {self.max_frames_for_roi_persistence} frames, ROI Smoothing: {self.roi_smoothing_factor}). App instance {'provided' if self.app else 'not provided (e.g. S3 mode)' }.")
 
     def _is_vr_video(self) -> bool:
         """Determines if the video is VR, using the override if available."""
@@ -267,6 +272,32 @@ class ROITracker:
         else:
             self.logger.warning("Detection model path not set or file does not exist.")
             self.classes = []
+
+    def _update_omni_axis(self, dx: float, dy: float) -> None:
+        """Update the dominant 2D direction unit vector for omni mode using EMA."""
+        try:
+            v = np.array([dx, dy], dtype=float)
+            n = np.linalg.norm(v)
+            if n < 1e-6:
+                return
+            u = v / n
+            self.omni_axis_unit = (1 - self.omni_axis_alpha) * self.omni_axis_unit + self.omni_axis_alpha * u
+            # Re-normalize to unit length
+            norm_u = np.linalg.norm(self.omni_axis_unit)
+            if norm_u > 1e-6:
+                self.omni_axis_unit = self.omni_axis_unit / norm_u
+        except Exception:
+            pass
+
+    def _project_positions_to_omni(self, primary_pos: int, secondary_pos: int) -> int:
+        """Project 2D positions onto current omni axis and return a single-axis 0-100 value."""
+        try:
+            # Map positions back to centered vector then project
+            v = np.array([float(secondary_pos) - 50.0, float(primary_pos) - 50.0], dtype=float)
+            s = float(np.dot(v, self.omni_axis_unit))
+            return int(np.clip(50.0 + s, 0, 100))
+        except Exception:
+            return int(np.clip((primary_pos + secondary_pos) / 2.0, 0, 100))
 
     def _load_models(self):
         """Legacy method - now just loads class names for compatibility."""
@@ -1359,6 +1390,14 @@ class ROITracker:
 
         if self.app and self.tracking_active and (min_write_frame_id is None or (frame_index is not None and frame_index >= min_write_frame_id)):
 
+            # Update omni axis from latest user ROI flow vector if available
+            try:
+                if isinstance(self.user_roi_current_flow_vector, tuple) and len(self.user_roi_current_flow_vector) == 2:
+                    dxv, dyv = self.user_roi_current_flow_vector
+                    self._update_omni_axis(dxv, dyv)
+            except Exception:
+                pass
+
             # Determine which axis we will write for this frame
             current_tracking_axis_mode = self.app.tracking_axis_mode
             current_single_axis_output = self.app.single_axis_output_target
@@ -1376,6 +1415,12 @@ class ROITracker:
                     primary_to_write = final_secondary_pos
                 else:
                     secondary_to_write = final_secondary_pos
+            elif current_tracking_axis_mode == "omni":
+                omni_pos = self._project_positions_to_omni(final_primary_pos, final_secondary_pos)
+                if current_single_axis_output == "primary":
+                    primary_to_write = omni_pos
+                else:
+                    secondary_to_write = omni_pos
 
             # --- Automatic Lag Compensation ---
             # Calculate the inherent delay from the smoothing window. A window of size N has a lag of (N-1)/2 frames.
@@ -1834,10 +1879,11 @@ class ROITracker:
 
         if block_motions:
             candidate_blocks = []
+            # First pass: collect all potential candidate blocks
             for motion in block_motions:
                 history = self.oscillation_history.get(motion['pos'])
                 # Only consider blocks with some history and current motion
-                if history and len(history) > 10 and motion['mag'] > (0.2 / threshold_factor):
+                if history and len(history) > 10 and motion['mag'] > 0.33:  # Fixed threshold for initial filtering
 
                     # 1. Get stats from history
                     recent_dy = [h['dy'] for h in history]
@@ -1859,10 +1905,16 @@ class ROITracker:
                     if oscillation_score > 0.5:  # Filter out low-scoring blocks
                         candidate_blocks.append({**motion, 'score': oscillation_score})
 
+            # Second pass: filter candidates based on relative scores
             if candidate_blocks:
-                max_score = max(b['score'] for b in candidate_blocks)
-                # Take any block that has at least 40% of the max score.
-                active_blocks = [b for b in candidate_blocks if b['score'] >= max_score * 0.4]
+                # Find the best block (highest score)
+                best_block = max(candidate_blocks, key=lambda x: x['score'])
+                
+                # Calculate threshold factor based on the best block's score
+                threshold_factor = 0.6  # 60% of max score as threshold
+                
+                # Take any block that has at least 60% of the best score
+                active_blocks = [b for b in candidate_blocks if b['score'] >= best_block['score'] * threshold_factor]
 
         # --- ADAPTIVE LOGIC PATH ---
 
@@ -1965,8 +2017,15 @@ class ROITracker:
                 tipLength=0.3
             )
 
-        # Step 6: Action Logging (unchanged)
+        # Step 6: Action Logging
         if self.tracking_active:
+            # Update omni axis from the most recent best-block motion if available
+            try:
+                if best_block is not None:
+                    self._update_omni_axis(best_block.get('dx', 0.0), best_block.get('dy', 0.0))
+            except Exception:
+                pass
+
             current_tracking_axis_mode = self.app.tracking_axis_mode
             current_single_axis_output = self.app.single_axis_output_target
             primary_to_write, secondary_to_write = None, None
@@ -1983,6 +2042,12 @@ class ROITracker:
                     primary_to_write = self.oscillation_funscript_secondary_pos
                 else:
                     secondary_to_write = self.oscillation_funscript_secondary_pos
+            elif current_tracking_axis_mode == "omni":
+                omni_pos = self._project_positions_to_omni(self.oscillation_funscript_pos, self.oscillation_funscript_secondary_pos)
+                if current_single_axis_output == "primary":
+                    primary_to_write = omni_pos
+                else:
+                    secondary_to_write = omni_pos
 
             self.funscript.add_action(timestamp_ms=frame_time_ms, primary_pos=primary_to_write, secondary_pos=secondary_to_write)
             action_log_list.append({"at": frame_time_ms, "pos": primary_to_write, "secondary_pos": secondary_to_write})
@@ -2109,18 +2174,106 @@ class ROITracker:
                 if mean_mag < 0.5 or (mean_mag > 0 and std_dev_dy / mean_mag < 0.5):  # c9e6fbd original thresholds
                     continue  # --- Filter non-oscillating motion
 
+                # Require oscillatory behavior (e.g., minimum zero-crossings)
                 smoothed_dys = np.convolve(dys, np.ones(5) / 5, mode='valid')
-                if len(smoothed_dys) < 2: continue
-                freq = (len(np.where(np.diff(np.sign(smoothed_dys)))[0]) / 2) / self.oscillation_history_seconds
+                zero_crossings = len(np.where(np.diff(np.sign(smoothed_dys)))[0])
+                if zero_crossings < 2:
+                    continue
 
-                # --- Adaptive Frequency Weighting (bell curve centered at 2.5Hz) ---
-                if 0.5 <= freq <= 7.0:  # c9e6fbd original frequency range
-                    freq_weight = np.exp(-((freq - 2.5) ** 2) / (2 * (1.5 ** 2)))  # Gaussian weight
-                    score = mean_mag * freq * freq_weight
-                    candidate_blocks.append({'pos': pos, 'score': score, 'dy': history[-1]['dy'], 'dx': history[-1]['dx'], 'mag': history[-1]['mag']})
+                # Adaptive Frequency Weighting (bell curve centered at 2.5Hz)
+                freq = zero_crossings / (2 * self.oscillation_history_seconds)
+                if not (0.5 <= freq <= 7.0):
+                    continue  # Ignore frequencies outside the valid range
 
+                freq_weight = np.exp(-((freq - 2.5) ** 2) / (2 * (1.5 ** 2)))  # Gaussian weight
+                score = mean_mag * freq * freq_weight
+                candidate_blocks.append({'pos': pos, 'score': score, 'dy': history[-1]['dy'], 'dx': history[-1]['dx'], 'mag': history[-1]['mag']})
+
+            # First pass: collect all potential candidate blocks with enhanced motion quality metrics
+            candidate_blocks = []
+            min_history_length = int(self.oscillation_history_max_len * 0.8)  # Require 80% history
+            
+            for pos, history in self.oscillation_history.items():
+                if len(history) < min_history_length:
+                    continue
+                    
+                # Extract motion data
+                mags = np.array([h['mag'] for h in history])
+                dys = np.array([h['dy'] for h in history])
+                dxs = np.array([h['dx'] for h in history])
+                
+                # Basic motion stats
+                mean_mag = np.mean(mags)
+                std_dev_dy = np.std(dys)
+                
+                # Skip blocks with insufficient motion or too consistent motion (like static walls)
+                if mean_mag < 0.3:  # Lower threshold to catch subtle motions
+                    continue
+
+                # Reject low-texture regions (e.g., plain white walls)
+                r, c = pos
+                bs = self.oscillation_block_size
+                y_start, x_start = r * bs, c * bs
+                patch = current_gray[y_start:y_start + bs, x_start:x_start + bs]
+                if patch.size == 0:
+                    continue
+                texture_var = cv2.Laplacian(patch, cv2.CV_64F).var()
+                if texture_var < 20.0:  # stricter texture threshold (tuneable)
+                    continue
+                    
+                # Calculate motion consistency (higher is better for actual movement)
+                motion_consistency = np.mean(np.abs(np.diff(dys))) * 10  # Scale up for better weighting
+                
+                # Detect direction changes (more changes = more likely to be actual movement)
+                direction_changes = np.sum(np.diff(np.sign(dys)) != 0)
+                
+                # Calculate motion quality score (emphasize changing directions and consistent motion)
+                motion_quality = (motion_consistency * (1 + direction_changes/len(history)))
+                
+                # Adaptive Frequency Weighting (bell curve centered at 2.5Hz)
+                smoothed_dys = np.convolve(dys, np.ones(5)/5, mode='valid')
+                zero_crossings = len(np.where(np.diff(np.sign(smoothed_dys)))[0])
+                
+                # Skip blocks without clear oscillation
+                if zero_crossings < 2:
+                    continue
+                    
+                freq = zero_crossings / (2 * self.oscillation_history_seconds)
+                if not (0.5 <= freq <= 7.0):
+                    continue
+                    
+                # Favor frequencies around 2.5Hz (typical for human motion)
+                freq_weight = np.exp(-((freq - 2.5) ** 2) / (2 * (1.5 ** 2)))
+                
+                # Combine metrics into final score, emphasizing motion quality
+                score = (mean_mag * 0.4 + motion_quality * 0.6) * freq_weight
+
+                # Skip top third entirely to avoid blank walls
+                v_norm = (r + 0.5) / max(1, self.oscillation_grid_size)
+                if v_norm < 1/3:
+                    continue
+
+                # Require recent motion magnitude to be non-trivial
+                recent_mag = float(np.percentile(mags, 70))
+                if recent_mag < 0.5:
+                    continue
+                
+                # Only include blocks with meaningful motion
+                if score > 0.3:  # Threshold to filter out noise
+                    candidate_blocks.append({
+                        'pos': pos, 
+                        'score': score, 
+                        'dy': history[-1]['dy'], 
+                        'dx': history[-1]['dx'], 
+                        'mag': history[-1]['mag'],
+                        'motion_quality': motion_quality
+                    })
+
+            # Second pass: filter candidates based on relative scores and cohesion
             if candidate_blocks:
                 candidate_pos = {b['pos'] for b in candidate_blocks}
+                
+                # Apply cohesion boost to scores
                 for block in candidate_blocks:
                     r, c = block['pos']
                     cohesion_boost = 1.0
@@ -2130,9 +2283,15 @@ class ROITracker:
                             if (r + dr, c + dc) in candidate_pos:
                                 cohesion_boost += 0.2  # Boost score by 20% for each active neighbor
                     block['score'] *= cohesion_boost
-
-                max_score = max(b['score'] for b in candidate_blocks)
-                active_blocks = [b for b in candidate_blocks if b['score'] > max_score * 0.6]  # c9e6fbd original: 60% threshold
+                
+                # Find the best block (highest score)
+                best_block = max(candidate_blocks, key=lambda x: x['score'])
+                
+                # Calculate threshold factor based on the best block's score
+                threshold_factor = 0.6  # 60% of max score as threshold
+                
+                # Take any block that has at least 60% of the best score
+                active_blocks = [b for b in candidate_blocks if b['score'] >= best_block['score'] * threshold_factor]
 
         if active_blocks:
             total_weight = sum(b['score'] for b in active_blocks)
@@ -2172,6 +2331,13 @@ class ROITracker:
 
         if self.tracking_active:
             # Use the same action logging logic as the current oscillation detector
+            # Update omni axis from the most recent best-block motion if available
+            try:
+                if best_block is not None:
+                    self._update_omni_axis(best_block.get('dx', 0.0), best_block.get('dy', 0.0))
+            except Exception:
+                pass
+
             current_tracking_axis_mode = self.app.tracking_axis_mode if self.app else "both"
             current_single_axis_output = self.app.single_axis_output_target if self.app else "primary"
             primary_to_write, secondary_to_write = None, None
@@ -2188,6 +2354,12 @@ class ROITracker:
                     primary_to_write = self.oscillation_funscript_secondary_pos
                 else:
                     secondary_to_write = self.oscillation_funscript_secondary_pos
+            elif current_tracking_axis_mode == "omni":
+                omni_pos = self._project_positions_to_omni(self.oscillation_funscript_pos, self.oscillation_funscript_secondary_pos)
+                if current_single_axis_output == "primary":
+                    primary_to_write = omni_pos
+                else:
+                    secondary_to_write = omni_pos
 
             self.funscript.add_action(timestamp_ms=frame_time_ms, primary_pos=primary_to_write, secondary_pos=secondary_to_write)
             action_log_list.append({"at": frame_time_ms, "pos": primary_to_write, "secondary_pos": secondary_to_write})

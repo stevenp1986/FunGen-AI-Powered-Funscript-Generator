@@ -249,6 +249,13 @@ class ApplicationLogic:
             tracker_model_path = self.yolo_detection_model_path_setting,
             pose_model_path = self.yolo_pose_model_path_setting,
             logger = self.logger)
+        # Apply omni-axis smoothing factor from settings to tracker
+        try:
+            omni_alpha = self.app_settings.get("omni_axis_alpha", 0.2)
+            if hasattr(self.tracker, "omni_axis_alpha"):
+                self.tracker.omni_axis_alpha = omni_alpha
+        except Exception:
+            pass
         if self.tracker:
             self.tracker.show_stats = False  # Default internal tracker states
             self.tracker.show_funscript_preview = False
@@ -1536,6 +1543,14 @@ class ApplicationLogic:
             if self.tracker: self.tracker.pose_model_path = self.yolo_pose_model_path
             self.logger.info(
                 f"Pose model path updated from settings: {os.path.basename(self.yolo_pose_model_path or '')}")
+
+        # Tracker: apply omni-axis smoothing factor
+        try:
+            omni_alpha = self.app_settings.get("omni_axis_alpha", defaults.get("omni_axis_alpha", 0.2))
+            if self.tracker and hasattr(self.tracker, "omni_axis_alpha"):
+                self.tracker.omni_axis_alpha = omni_alpha
+        except Exception:
+            pass
 
         # Inform sub-modules to update their settings
         # TODO: Refactor this to use tuple unpacking

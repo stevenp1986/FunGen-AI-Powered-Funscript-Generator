@@ -91,6 +91,8 @@ class AppSettings:
             "discarded_tracking_classes": constants.CLASSES_TO_DISCARD_BY_DEFAULT,
             "tracking_axis_mode": "both",
             "single_axis_output_target": "primary",
+            # Omni-axis mode smoothing factor (EMA alpha)
+            "omni_axis_alpha": 0.2,
 
             # --- Live Tracker Settings ---
             "live_tracker_confidence_threshold": constants.DEFAULT_TRACKER_CONFIDENCE_THRESHOLD,

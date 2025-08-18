@@ -1459,12 +1459,19 @@ class ControlPanelUI:
 
     def _render_tracking_axes_mode(self, stage_proc):
         """Renders UI elements for tracking axis mode."""
-        axis_modes = ["Both Axes (Up/Down + Left/Right)", "Up/Down Only (Vertical)", "Left/Right Only (Horizontal)"]
+        axis_modes = [
+            "Both Axes (Up/Down + Left/Right)",
+            "Up/Down Only (Vertical)",
+            "Left/Right Only (Horizontal)",
+            "Omni (Dominant Direction)",
+        ]
         current_axis_mode_idx = 0
         if self.app.tracking_axis_mode == "vertical":
             current_axis_mode_idx = 1
         elif self.app.tracking_axis_mode == "horizontal":
             current_axis_mode_idx = 2
+        elif self.app.tracking_axis_mode == "omni":
+            current_axis_mode_idx = 3
 
         processor = self.app.processor
         disable_axis_controls = (
@@ -1483,13 +1490,35 @@ class ControlPanelUI:
                 self.app.tracking_axis_mode = "both"
             elif new_axis_mode_idx == 1:
                 self.app.tracking_axis_mode = "vertical"
-            else:
+            elif new_axis_mode_idx == 2:
                 self.app.tracking_axis_mode = "horizontal"
+            else:
+                self.app.tracking_axis_mode = "omni"
             if old_mode != self.app.tracking_axis_mode:
                 self.app.project_manager.project_dirty = True
                 self.app.logger.info(f"Tracking axis mode set to: {self.app.tracking_axis_mode}", extra={'status_message': True})
-                self.app.app_settings.set("tracking_axis_mode", self.app.tracking_axis_mode) # Auto-save
+                self.app.app_settings.set("tracking_axis_mode", self.app.tracking_axis_mode)  # Auto-save
                 self.app.energy_saver.reset_activity_timer()
+
+        # Omni smoothing slider (only when Omni mode is selected)
+        if self.app.tracking_axis_mode == "omni":
+            imgui.text("Omni Axis Smoothing")
+            imgui.same_line()
+            imgui.push_item_width(180)
+            cur_alpha = self.app.app_settings.get("omni_axis_alpha", 0.2)
+            ch, new_alpha = imgui.slider_float("##OmniAxisAlpha", cur_alpha, 0.0, 1.0, "%.2f")
+            if ch and new_alpha != cur_alpha:
+                self.app.app_settings.set("omni_axis_alpha", new_alpha)  # Auto-save
+                tr = getattr(self.app, "tracker", None)
+                if tr and hasattr(tr, "omni_axis_alpha"):
+                    try:
+                        tr.omni_axis_alpha = new_alpha
+                    except Exception:
+                        pass
+                self.app.project_manager.project_dirty = True
+                self.app.energy_saver.reset_activity_timer()
+            imgui.pop_item_width()
+            _tooltip_if_hovered("Exponential smoothing factor (EMA) for Omni axis (0=no smoothing, 1=very heavy smoothing).")
 
         if self.app.tracking_axis_mode != "both":
             imgui.text("Output Single Axis To:")
@@ -1503,7 +1532,7 @@ class ControlPanelUI:
                 if old_target != self.app.single_axis_output_target:
                     self.app.project_manager.project_dirty = True
                     self.app.logger.info(f"Single axis output target set to: {self.app.single_axis_output_target}", extra={'status_message': True})
-                    self.app.app_settings.set("single_axis_output_target", self.app.single_axis_output_target) # Auto-save
+                    self.app.app_settings.set("single_axis_output_target", self.app.single_axis_output_target)  # Auto-save
                     self.app.energy_saver.reset_activity_timer()
         if disable_axis_controls:
             imgui.pop_style_var()
@@ -1512,7 +1541,7 @@ class ControlPanelUI:
     def _render_oscillation_detector_settings(self):
         app = self.app
         settings = app.app_settings
-
+        
         imgui.text("Analysis Grid Size")
         _tooltip_if_hovered(
             "Finer grids (higher numbers) are more precise but use more CPU.\n"
