@@ -108,6 +108,25 @@ class AppSettings:
             "live_tracker_class_amp_multipliers": constants.DEFAULT_CLASS_AMP_MULTIPLIERS,
             "live_tracker_flow_smoothing_window": constants.DEFAULT_FLOW_HISTORY_SMOOTHING_WINDOW,
 
+            # --- DOT Tracker Defaults ---
+            # HSV thresholds for bright dot isolation
+            "dot_h_low": 0,
+            "dot_h_high": 179,
+            "dot_s_low": 0,
+            "dot_s_high": 80,
+            "dot_v_low": 200,
+            "dot_v_high": 255,
+            # Detection method and constraints
+            "dot_use_hough": True,
+            "dot_min_radius": 2,
+            "dot_max_radius": 18,
+            "dot_blob_min_area": 10,
+            "dot_blob_max_area": 800,
+            "dot_min_brightness": 180,
+            # Smoothing and overlay
+            "dot_smoothing_alpha": 0.3,
+            "dot_overlay_enabled": True,
+
             # --- Settings for the 2D Oscillation Detector ---
             "oscillation_detector_grid_size": 20,
             "oscillation_detector_sensitivity": 2.5,

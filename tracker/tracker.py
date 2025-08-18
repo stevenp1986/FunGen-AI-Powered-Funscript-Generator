@@ -218,6 +218,10 @@ class ROITracker:
         # --- Initialize deque with a default maxlen. It will be resized in start_tracking. ---
         self.oscillation_position_history = deque(maxlen=120)  # Default to 4 seconds @ 30fps
         self.oscillation_last_known_pos: float = 50.0
+
+        # --- DOT Tracker state ---
+        self.dot_smoothed_xy: Optional[Tuple[float, float]] = None
+        self.dot_last_detected_xy: Optional[Tuple[int, int]] = None
         self.oscillation_last_known_secondary_pos = 50.0
         self.oscillation_last_active_time = 0
         self.oscillation_hold_duration_ms = 200  # Hold for 200ms before decaying
@@ -1167,6 +1171,8 @@ class ROITracker:
             return self.process_frame_for_oscillation(frame, frame_time_ms, frame_index)
         elif self.tracking_mode == "OSCILLATION_DETECTOR_LEGACY":
             return self.process_frame_for_oscillation_legacy(frame, frame_time_ms, frame_index)
+        elif self.tracking_mode == "DOT_TRACKER":
+            return self.process_frame_for_dot_tracker(frame, frame_time_ms, frame_index)
 
         self._update_fps()
         processed_frame = self.preprocess_frame(frame)
@@ -1495,6 +1501,195 @@ class ROITracker:
         self.internal_frame_counter += 1
         return processed_frame, action_log_list if action_log_list else None
 
+    def process_frame_for_dot_tracker(self, frame: np.ndarray, frame_time_ms: int, frame_index: Optional[int] = None) -> Tuple[np.ndarray, Optional[List[Dict]]]:
+        """Detect and track a bright dot and output normalized positions.
+        - Uses HSV thresholding for bright dot isolation
+        - HoughCircles first, contour/blob fallback
+        - EMA smoothing of (x,y)
+        - Overlays circle and label when enabled
+        - Normalizes to 0-100 for funscript output
+        """
+        self._update_fps()
+        action_log_list: List[Dict] = []
+
+        # Settings with safe defaults
+        get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
+        h_low, h_high = int(get('dot_h_low', 0)), int(get('dot_h_high', 179))
+        s_low, s_high = int(get('dot_s_low', 0)), int(get('dot_s_high', 80))
+        v_low, v_high = int(get('dot_v_low', 200)), int(get('dot_v_high', 255))
+        use_hough = bool(get('dot_use_hough', True))
+        rmin, rmax = int(get('dot_min_radius', 2)), int(get('dot_max_radius', 18))
+        blob_min_area = float(get('dot_blob_min_area', 10))
+        blob_max_area = float(get('dot_blob_max_area', 800))
+        min_brightness = int(get('dot_min_brightness', 180))
+        alpha = float(get('dot_smoothing_alpha', 0.3))
+        overlay_enabled = bool(get('dot_overlay_enabled', True))
+
+        # Preprocess and convert
+        processed_frame = self.preprocess_frame(frame)
+        hsv = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2HSV)
+        h, w = processed_frame.shape[:2]
+
+        # Threshold bright regions
+        lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
+        upper = np.array([h_high, s_high, v_high], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        # Morphology to clean noise
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        detected_xy: Optional[Tuple[int, int]] = None
+
+        # Try HoughCircles on the value channel masked
+        if use_hough:
+            v_chan = hsv[:, :, 2]
+            v_masked = cv2.bitwise_and(v_chan, v_chan, mask=mask)
+            # Slight blur helps Hough
+            v_blur = cv2.GaussianBlur(v_masked, (5, 5), 1.5)
+            try:
+                circles = cv2.HoughCircles(v_blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=15,
+                                            param1=100, param2=12, minRadius=max(1, rmin), maxRadius=max(rmin+1, rmax))
+            except Exception:
+                circles = None
+            if circles is not None and len(circles) > 0:
+                circles = np.uint16(np.around(circles))
+                # Choose the brightest circle center
+                best = None
+                best_v = -1
+                for c in circles[0, :]:
+                    cx, cy, rr = int(c[0]), int(c[1]), int(c[2])
+                    if rr < rmin or rr > rmax:
+                        continue
+                    if 0 <= cx < w and 0 <= cy < h:
+                        val = int(v_chan[cy, cx])
+                        if val > best_v:
+                            best_v = val
+                            best = (cx, cy)
+                if best is not None:
+                    detected_xy = best
+
+        # Fallback: contour-based blob detection
+        if detected_xy is None:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            best = None
+            best_score = -1.0
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < blob_min_area or area > blob_max_area:
+                    continue
+                (x, y), r = cv2.minEnclosingCircle(cnt)
+                if r < rmin or r > rmax:
+                    continue
+                cx, cy = int(x), int(y)
+                if 0 <= cx < w and 0 <= cy < h:
+                    if hsv[cy, cx, 2] >= min_brightness:
+                        # Prefer rounder and brighter blobs
+                        perimeter = cv2.arcLength(cnt, True)
+                        circularity = 0.0 if perimeter == 0 else (4 * math.pi * area) / (perimeter * perimeter)
+                        score = circularity * 0.7 + (hsv[cy, cx, 2] / 255.0) * 0.3
+                        if score > best_score:
+                            best_score = score
+                            best = (cx, cy)
+            if best is not None:
+                detected_xy = best
+
+        # Smooth position
+        if detected_xy is not None:
+            self.dot_last_detected_xy = detected_xy
+            if self.dot_smoothed_xy is None:
+                self.dot_smoothed_xy = (float(detected_xy[0]), float(detected_xy[1]))
+            else:
+                sx, sy = self.dot_smoothed_xy
+                cx, cy = detected_xy
+                self.dot_smoothed_xy = (sx * (1.0 - alpha) + cx * alpha, sy * (1.0 - alpha) + cy * alpha)
+
+        # Choose current position (smoothed preferred)
+        cur_xy = None
+        if self.dot_smoothed_xy is not None:
+            cur_xy = (int(round(self.dot_smoothed_xy[0])), int(round(self.dot_smoothed_xy[1])))
+        elif self.dot_last_detected_xy is not None:
+            cur_xy = self.dot_last_detected_xy
+
+        # Overlay
+        if overlay_enabled and cur_xy is not None:
+            cv2.circle(processed_frame, cur_xy, 5, RGBColors.GREEN, 2)
+            cv2.circle(processed_frame, cur_xy, 2, RGBColors.RED, -1)
+            cv2.putText(processed_frame, f"Dot {cur_xy}", (cur_xy[0] + 6, cur_xy[1] - 6), cv2.FONT_HERSHEY_PLAIN, 0.8, RGBColors.GREEN, 1)
+
+        # Normalize to 0-100; if no detection, hold last value or default to center
+        if cur_xy is not None:
+            x_norm = int(np.clip(100.0 * (cur_xy[0] / max(1.0, float(w))), 0, 100))
+            y_norm = int(np.clip(100.0 * (1.0 - (cur_xy[1] / max(1.0, float(h)))), 0, 100))
+        else:
+            x_norm, y_norm = 50, 50
+
+        final_primary_pos = y_norm
+        final_secondary_pos = x_norm
+
+        # Stats display
+        self.stats_display = [f"Dot FPS:{self.current_fps:.1f} T(ms):{frame_time_ms}"]
+        if frame_index is not None:
+            self.stats_display.append(f"FIdx:{frame_index}")
+
+        # Write funscript if active
+        if self.app and self.tracking_active:
+            # Determine axis based on app settings
+            current_tracking_axis_mode = getattr(self.app, 'tracking_axis_mode', 'both')
+            current_single_axis_output = getattr(self.app, 'single_axis_output_target', 'primary')
+            primary_to_write, secondary_to_write = None, None
+            if current_tracking_axis_mode == "both":
+                primary_to_write, secondary_to_write = final_primary_pos, final_secondary_pos
+            elif current_tracking_axis_mode == "vertical":
+                if current_single_axis_output == "primary":
+                    primary_to_write = final_primary_pos
+                else:
+                    secondary_to_write = final_primary_pos
+            elif current_tracking_axis_mode == "horizontal":
+                if current_single_axis_output == "primary":
+                    primary_to_write = final_secondary_pos
+                else:
+                    secondary_to_write = final_secondary_pos
+            elif current_tracking_axis_mode == "omni":
+                omni_pos = self._project_positions_to_omni(final_primary_pos, final_secondary_pos)
+                if current_single_axis_output == "primary":
+                    primary_to_write = omni_pos
+                else:
+                    secondary_to_write = omni_pos
+
+            # Delay compensation (reuse smoothing window for symmetry)
+            automatic_smoothing_delay_frames = (self.flow_history_window_smooth - 1) / 2.0 if self.flow_history_window_smooth > 1 else 0.0
+            total_delay_frames = self.output_delay_frames + automatic_smoothing_delay_frames
+            base_delay_ms = (total_delay_frames / self.current_video_fps_for_delay) * 1000.0 if self.current_video_fps_for_delay > 0 else 0.0
+            primary_empty = (len(self.funscript.primary_actions) == 0)
+            secondary_empty = (len(self.funscript.secondary_actions) == 0)
+            effective_delay_ms = 0.0 if (primary_empty and primary_to_write is not None) or (secondary_empty and secondary_to_write is not None) else base_delay_ms
+            adjusted_frame_time_ms = frame_time_ms - effective_delay_ms
+
+            is_file_processing_context = frame_index is not None
+            self.funscript.add_action(
+                timestamp_ms=int(round(adjusted_frame_time_ms)),
+                primary_pos=primary_to_write,
+                secondary_pos=secondary_to_write,
+                is_from_live_tracker=(not is_file_processing_context)
+            )
+            action_log_list.append({
+                "at": int(round(adjusted_frame_time_ms)), "pos": primary_to_write, "secondary_pos": secondary_to_write,
+                "raw_ud_pos_computed": final_primary_pos, "raw_lr_pos_computed": final_secondary_pos,
+                "mode": current_tracking_axis_mode,
+                "target": current_single_axis_output if current_tracking_axis_mode != "both" else "N/A",
+                "raw_at": frame_time_ms, "delay_applied_ms": effective_delay_ms,
+                "roi_main": None,
+                "amp": self.current_effective_amp_factor
+            })
+
+        # Show stats
+        if self.show_stats:
+            for i, stat_text in enumerate(self.stats_display):
+                cv2.putText(processed_frame, stat_text, (5, 15 + i * 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, RGBColors.TEAL, 1)
+
+        return processed_frame, action_log_list if action_log_list else None
+
     def get_class_color(self, class_name: Optional[str]) -> Tuple[int, int, int]:
         return RGBColors.CLASS_COLORS.get(class_name.lower() if class_name else "", RGBColors.GREY_LIGHT)
 
@@ -1569,6 +1764,10 @@ class ROITracker:
                 self.user_roi_tracked_point_relative = self.user_roi_initial_point_relative
             self.user_roi_current_flow_vector = (0.0, 0.0)
             self.logger.info("User Defined ROI Tracking started.")
+        elif self.tracking_mode == "DOT_TRACKER":
+            self.dot_smoothed_xy = None
+            self.dot_last_detected_xy = None
+            self.logger.info("Dot Tracker started.")
 
     def stop_tracking(self):
         self.tracking_active = False
