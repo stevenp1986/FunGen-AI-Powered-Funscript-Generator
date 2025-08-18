@@ -204,6 +204,10 @@ class ApplicationLogic:
         self.autotuner_best_fps: float = 0.0
         self.autotuner_forced_hwaccel: Optional[str] = None
 
+        # --- UI interaction modes ---
+        # Existing flags are initialized elsewhere during lifecycle; ensure dot-pick has a default
+        self.is_setting_dot_pick_mode: bool = False
+
         # --- Hardware Acceleration
         # Query ffmpeg for available hardware accelerations
         self.available_ffmpeg_hwaccels = self._get_available_ffmpeg_hwaccels()
@@ -1072,12 +1076,53 @@ class ApplicationLogic:
         self.logger.info("Setting User Defined ROI: Draw rectangle on video, then click point inside.", extra={'status_message': True, 'duration': 5.0})
         self.energy_saver.reset_activity_timer()
 
+    def enter_set_dot_pick_mode(self):
+        """Enable click-to-select mode for DOT tracker initial point selection."""
+        if self.processor and self.processor.is_processing:
+            self.processor.pause_processing()
+            self.logger.info("Video paused to pick dot.")
+
+        self.is_setting_dot_pick_mode = True
+        # Reset any related UI drawing states to avoid conflicts
+        if self.gui_instance and hasattr(self.gui_instance, 'video_display_ui'):
+            vdui = self.gui_instance.video_display_ui
+            if hasattr(vdui, 'is_drawing_user_roi'):
+                vdui.is_drawing_user_roi = False
+            if hasattr(vdui, 'waiting_for_point_click'):
+                vdui.waiting_for_point_click = False
+            if hasattr(vdui, 'is_drawing_oscillation_area'):
+                vdui.is_drawing_oscillation_area = False
+
+        self.logger.info("Pick Dot: Click the dot on the video to set its position.", extra={'status_message': True, 'duration': 5.0})
+        self.energy_saver.reset_activity_timer()
+
     def exit_set_user_roi_mode(self):
         self.is_setting_user_roi_mode = False
         if self.gui_instance and hasattr(self.gui_instance, 'video_display_ui'):
             self.gui_instance.video_display_ui.is_drawing_user_roi = False
             self.gui_instance.video_display_ui.drawn_user_roi_video_coords = None
             self.gui_instance.video_display_ui.waiting_for_point_click = False
+
+    def exit_set_dot_pick_mode(self):
+        """Disable dot pick mode and clear any transient UI state."""
+        self.is_setting_dot_pick_mode = False
+        if self.gui_instance and hasattr(self.gui_instance, 'video_display_ui'):
+            vdui = self.gui_instance.video_display_ui
+            if hasattr(vdui, 'is_drawing_user_roi'):
+                vdui.is_drawing_user_roi = False
+            if hasattr(vdui, 'waiting_for_point_click'):
+                vdui.waiting_for_point_click = False
+            # Clear dot-boundary drawing UI state
+            if hasattr(vdui, 'is_drawing_dot_boundary'):
+                vdui.is_drawing_dot_boundary = False
+            if hasattr(vdui, 'drawn_dot_boundary_video_coords'):
+                vdui.drawn_dot_boundary_video_coords = None
+            if hasattr(vdui, 'waiting_for_dot_point_click'):
+                vdui.waiting_for_dot_point_click = False
+            if hasattr(vdui, 'dot_boundary_draw_start_screen_pos'):
+                vdui.dot_boundary_draw_start_screen_pos = (0, 0)
+            if hasattr(vdui, 'dot_boundary_draw_current_screen_pos'):
+                vdui.dot_boundary_draw_current_screen_pos = (0, 0)
 
     def user_roi_and_point_set(self, roi_rect_video_coords: Tuple[int, int, int, int], point_video_coords: Tuple[int, int]):
         if self.chapter_id_for_roi_setting:
@@ -1154,6 +1199,18 @@ class ApplicationLogic:
                 vdui.oscillation_area_draw_start_screen_pos = (0, 0)
             if hasattr(vdui, 'oscillation_area_draw_current_screen_pos'):
                 vdui.oscillation_area_draw_current_screen_pos = (0, 0)
+
+            # Dot boundary rectangle (dot pick mode) drawing state
+            if hasattr(vdui, 'is_drawing_dot_boundary'):
+                vdui.is_drawing_dot_boundary = False
+            if hasattr(vdui, 'drawn_dot_boundary_video_coords'):
+                vdui.drawn_dot_boundary_video_coords = None
+            if hasattr(vdui, 'waiting_for_dot_point_click'):
+                vdui.waiting_for_dot_point_click = False
+            if hasattr(vdui, 'dot_boundary_draw_start_screen_pos'):
+                vdui.dot_boundary_draw_start_screen_pos = (0, 0)
+            if hasattr(vdui, 'dot_boundary_draw_current_screen_pos'):
+                vdui.dot_boundary_draw_current_screen_pos = (0, 0)
 
     def enter_set_oscillation_area_mode(self):
         if self.processor and self.processor.is_processing:

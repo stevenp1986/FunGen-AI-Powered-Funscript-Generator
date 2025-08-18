@@ -126,6 +126,12 @@ class AppSettings:
             # Smoothing and overlay
             "dot_smoothing_alpha": 0.3,
             "dot_overlay_enabled": True,
+            # Selection-assisted tracking
+            "dot_lock_horizontal": True,           # If True, fix x at selected column for output
+            "dot_search_half_width": 24,           # Half bandwidth (px) around selected x to search
+            "dot_hue_tol": 12,                     # +/- hue tolerance around sampled hue (OpenCV 0-179)
+            "dot_sat_tol": 80,                     # +/- sat tolerance around sampled S
+            "dot_val_tol": 80,                     # +/- val tolerance around sampled V
 
             # --- Settings for the 2D Oscillation Detector ---
             "oscillation_detector_grid_size": 20,

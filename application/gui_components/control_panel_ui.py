@@ -1051,29 +1051,74 @@ class ControlPanelUI:
             self._render_stage_progress_ui(stage_proc)
             return
 
-        if mode in (self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY):
+        if mode in (self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY, getattr(self.TrackerMode, 'DOT_TRACKER', None)):
             tr = app.tracker
             imgui.text(">> Tracker Status")
-            imgui.separator()
-            fps = (tr.current_fps if tr else 0.0)
-            imgui.text(" - Actual FPS: %.1f" % (fps if isinstance(fps, (int, float)) else 0.0))
-            roi_status = "Not Set"
             if tr:
+                roi_status = "Not Set"
                 if mode == self.TrackerMode.LIVE_YOLO_ROI:
-                    roi_status = (
-                        "Tracking '%s'" % tr.main_interaction_class
-                        if getattr(tr, "main_interaction_class", None)
-                        else "Searching..."
-                    )
+                    if getattr(tr, "current_roi", None) is not None:
+                        roi_status = (
+                            "Locked" if getattr(tr, "roi_locked", False)
+                            else "Tracking" if getattr(tr, "roi_tracking_active", False)
+                            else "Searching..."
+                        )
                 elif mode == self.TrackerMode.LIVE_USER_ROI:
                     roi_status = "Set" if getattr(tr, "user_roi_fixed", False) else "Not Set"
                 elif mode in [self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY]:
                     roi_status = "Set" if getattr(tr, "oscillation_area_fixed", None) else "Not Set"
+                elif getattr(self.TrackerMode, 'DOT_TRACKER', None) and mode == self.TrackerMode.DOT_TRACKER:
+                    # Show whether a dot column/point was selected
+                    has_dot = getattr(tr, "dot_initial_point", None) is not None or getattr(tr, "dot_selected_column", None) is not None
+                    roi_status = "Dot Selected" if has_dot else "Waiting for dot pick"
             imgui.text(" - ROI Status: %s" % roi_status)
 
             if mode == self.TrackerMode.LIVE_USER_ROI:
                 self._render_user_roi_controls_for_run_tab()
+            elif getattr(self.TrackerMode, 'DOT_TRACKER', None) and mode == self.TrackerMode.DOT_TRACKER:
+                self._render_dot_tracker_controls_for_run_tab()
             return
+
+    def _render_dot_tracker_controls_for_run_tab(self):
+        app = self.app
+        sp = app.stage_processor
+        proc = app.processor
+
+        imgui.spacing()
+
+        # Disable when analysis running, no video, or conflicting user-ROI mode
+        set_disabled = (
+            sp.full_analysis_active
+            or not (proc and proc.is_video_open())
+            or (proc and proc.is_processing and not proc.pause_event.is_set())
+            or app.is_setting_user_roi_mode
+        )
+
+        with _DisabledScope(set_disabled):
+            picking = getattr(app, 'is_setting_dot_pick_mode', False)
+            btn_label = "Cancel Pick" if picking else "Pick Dot"
+            if picking:
+                # Red-ish cancel style while active
+                g = self.GeneralColors
+                imgui.push_style_color(imgui.COLOR_BUTTON, *g.RED_DARK)
+                imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, *g.RED_LIGHT)
+                imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, *g.RED_LIGHT)
+            if imgui.button(f"{btn_label}##DotPickToggle", width=-1):
+                if picking:
+                    app.exit_set_dot_pick_mode()
+                else:
+                    app.enter_set_dot_pick_mode()
+            if picking:
+                imgui.pop_style_color(3)
+
+        # Disabled tooltip
+        if set_disabled and imgui.is_item_hovered():
+            imgui.set_tooltip("Disabled while processing or no video loaded.")
+
+        # Hint while active
+        if getattr(app, 'is_setting_dot_pick_mode', False):
+            col = self.ControlPanelColors.STATUS_WARNING
+            imgui.text_ansi_colored("Selection Active: Click the dot in the video.", *col)
 
 # ------- Live tracker settings -------
 

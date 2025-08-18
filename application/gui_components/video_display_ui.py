@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 
 import config.constants as constants
-from config.element_group_colors import VideoDisplayColors
+from config.element_group_colors import VideoDisplayColors, ControlPanelColors
 
 
 class VideoDisplayUI:
@@ -27,6 +27,13 @@ class VideoDisplayUI:
         self.oscillation_area_draw_current_screen_pos: tuple = (0, 0)  # In ImGui screen space
         self.drawn_oscillation_area_video_coords: tuple | None = None  # (x,y,w,h) in original video frame pixel space
         self.waiting_for_oscillation_point_click: bool = False
+
+        # Dot Tracker Boundary Drawing state
+        self.is_drawing_dot_boundary: bool = False
+        self.dot_boundary_draw_start_screen_pos: tuple = (0, 0)  # In ImGui screen space
+        self.dot_boundary_draw_current_screen_pos: tuple = (0, 0)  # In ImGui screen space
+        self.drawn_dot_boundary_video_coords: tuple | None = None  # (x,y,w,h) in processed video pixel space
+        self.waiting_for_dot_point_click: bool = False
 
     def _update_actual_video_image_rect(self, display_w, display_h, cursor_x_offset, cursor_y_offset):
         win_pos_x, win_pos_y = imgui.get_window_position()
@@ -517,6 +524,10 @@ class VideoDisplayUI:
                                 self.app.logger.info("Oscillation area drawing cancelled (mouse released outside video).", extra={'status_message': True})
 
                             # Visualization of active Oscillation Area (ROI outline)
+                            # Initialize optional overlay anchors to avoid UnboundLocalError
+                            area_start_screen = None
+                            area_end_screen = None
+
                             # Rule: If ROI toggle is ON => always show. If ROI toggle is OFF => show only when not actively tracking (paused/stopped).
                             if self.app.tracker and self.app.tracker.oscillation_area_fixed is not None and not self.app.is_setting_oscillation_area_mode:
                                 tracker = self.app.tracker
@@ -530,13 +541,107 @@ class VideoDisplayUI:
                                     ax_vid, ay_vid, aw_vid, ah_vid = tracker.oscillation_area_fixed
                                     area_start_screen = self._video_to_screen_coords(ax_vid, ay_vid)
                                     area_end_screen = self._video_to_screen_coords(ax_vid + aw_vid, ay_vid + ah_vid)
-                                    if area_start_screen and area_end_screen:
-                                        draw_list.add_rect(area_start_screen[0], area_start_screen[1], area_end_screen[0], area_end_screen[1], imgui.get_color_u32_rgba(0, 128, 255, 255), thickness=2)
-                                        draw_list.add_text(area_start_screen[0], area_start_screen[1] - 15, imgui.get_color_u32_rgba(0, 255, 255, 255), "Oscillation Area")
+                            
+                            # --- Dot Pick Boundary Draw + Click Logic (for DOT_TRACKER) ---
+                            if getattr(self.app, 'is_setting_dot_pick_mode', False):
+                                draw_list = imgui.get_window_draw_list()
+                                img_rect = self._actual_video_image_rect_on_screen
+                                # Hint
+                                draw_list.add_text(
+                                    img_rect['min_x'] + 8, img_rect['min_y'] + 8,
+                                    imgui.get_color_u32_rgba(*ControlPanelColors.STATUS_INFO),
+                                    "Dot: Draw boundary rectangle, then click the dot inside"
+                                )
 
-                                    # Do not draw grid blocks in overlay
+                                # Keep the just-drawn boundary visible while waiting for the point click
+                                if self.waiting_for_dot_point_click and self.drawn_dot_boundary_video_coords:
+                                    draw_list.push_clip_rect(img_rect['min_x'], img_rect['min_y'], img_rect['max_x'], img_rect['max_y'], True)
+                                    bx_vid, by_vid, bw_vid, bh_vid = self.drawn_dot_boundary_video_coords
+                                    b_start = self._video_to_screen_coords(bx_vid, by_vid)
+                                    b_end = self._video_to_screen_coords(bx_vid + bw_vid, by_vid + bh_vid)
+                                    if b_start and b_end:
+                                        draw_list.add_rect(b_start[0], b_start[1], b_end[0], b_end[1], imgui.get_color_u32_rgba(*VideoDisplayColors.ROI_BORDER), thickness=2)
+                                    draw_list.pop_clip_rect()
 
-                                # Do not draw the block grid outline here. Grid visualization is handled in-frame or elsewhere.
+                                if is_hovering_actual_video_image:
+                                    # Phase 1: Draw boundary rectangle
+                                    if not self.waiting_for_dot_point_click:
+                                        if io.mouse_down[0] and not self.is_drawing_dot_boundary:
+                                            self.is_drawing_dot_boundary = True
+                                            self.dot_boundary_draw_start_screen_pos = io.mouse_pos
+                                            self.dot_boundary_draw_current_screen_pos = io.mouse_pos
+                                            self.drawn_dot_boundary_video_coords = None
+                                            self.app.energy_saver.reset_activity_timer()
+
+                                        if self.is_drawing_dot_boundary:
+                                            self.dot_boundary_draw_current_screen_pos = io.mouse_pos
+                                            draw_list.add_rect(
+                                                min(self.dot_boundary_draw_start_screen_pos[0], self.dot_boundary_draw_current_screen_pos[0]),
+                                                min(self.dot_boundary_draw_start_screen_pos[1], self.dot_boundary_draw_current_screen_pos[1]),
+                                                max(self.dot_boundary_draw_start_screen_pos[0], self.dot_boundary_draw_current_screen_pos[0]),
+                                                max(self.dot_boundary_draw_start_screen_pos[1], self.dot_boundary_draw_current_screen_pos[1]),
+                                                imgui.get_color_u32_rgba(*VideoDisplayColors.ROI_DRAWING), thickness=2
+                                            )
+
+                                        if not io.mouse_down[0] and self.is_drawing_dot_boundary:
+                                            self.is_drawing_dot_boundary = False
+                                            start_vid = self._screen_to_video_coords(*self.dot_boundary_draw_start_screen_pos)
+                                            end_vid = self._screen_to_video_coords(*self.dot_boundary_draw_current_screen_pos)
+                                            if start_vid and end_vid:
+                                                vx1, vy1 = start_vid
+                                                vx2, vy2 = end_vid
+                                                bx, by = min(vx1, vx2), min(vy1, vy2)
+                                                bw, bh = abs(vx2 - vx1), abs(vy2 - vy1)
+                                                if bw > 5 and bh > 5:
+                                                    self.drawn_dot_boundary_video_coords = (bx, by, bw, bh)
+                                                    self.waiting_for_dot_point_click = True
+                                                    self.app.logger.info("Boundary drawn. Click the dot inside the boundary.", extra={'status_message': True, 'duration': 5.0})
+                                                else:
+                                                    self.app.logger.info("Drawn boundary is too small. Please redraw.", extra={'status_message': True})
+                                                    self.drawn_dot_boundary_video_coords = None
+                                            else:
+                                                self.app.logger.warning("Could not convert boundary coords to video coords (likely outside video area).")
+                                                self.drawn_dot_boundary_video_coords = None
+
+                                    # Phase 2: Click dot inside boundary
+                                    elif self.waiting_for_dot_point_click and self.drawn_dot_boundary_video_coords:
+                                        if imgui.is_mouse_clicked(0):
+                                            self.app.energy_saver.reset_activity_timer()
+                                            point_vid = self._screen_to_video_coords(*io.mouse_pos)
+                                            if point_vid:
+                                                bx, by, bw, bh = self.drawn_dot_boundary_video_coords
+                                                if bx <= point_vid[0] < bx + bw and by <= point_vid[1] < by + bh:
+                                                    if hasattr(self.app, 'tracker') and self.app.tracker:
+                                                        current_frame = None
+                                                        if self.app.processor and self.app.processor.current_frame is not None:
+                                                            current_frame = self.app.processor.current_frame.copy()
+                                                        try:
+                                                            self.app.tracker.set_dot_boundary_and_point(
+                                                                self.drawn_dot_boundary_video_coords,
+                                                                point_vid,
+                                                                current_frame
+                                                            )
+                                                            self.app.logger.info(
+                                                                f"Dot boundary set and dot selected at ({point_vid[0]}, {point_vid[1]}).",
+                                                                extra={'status_message': True, 'duration': 4.0}
+                                                            )
+                                                        except Exception as e:
+                                                            self.app.logger.error(f"Failed to set dot boundary/point: {e}")
+                                                    # Reset state and exit mode
+                                                    self.waiting_for_dot_point_click = False
+                                                    self.drawn_dot_boundary_video_coords = None
+                                                    self.is_drawing_dot_boundary = False
+                                                    self.dot_boundary_draw_start_screen_pos = (0, 0)
+                                                    self.dot_boundary_draw_current_screen_pos = (0, 0)
+                                                    if hasattr(self.app, 'exit_set_dot_pick_mode'):
+                                                        self.app.exit_set_dot_pick_mode()
+                                                else:
+                                                    self.app.logger.info("Clicked point is outside the boundary. Please click inside.", extra={'status_message': True})
+
+                                # Also render oscillation outline if present (non-interfering)
+                                if area_start_screen and area_end_screen:
+                                    draw_list.add_rect(area_start_screen[0], area_start_screen[1], area_end_screen[0], area_end_screen[1], imgui.get_color_u32_rgba(0, 128, 255, 255), thickness=2)
+                                    draw_list.add_text(area_start_screen[0], area_start_screen[1] - 15, imgui.get_color_u32_rgba(0, 255, 255, 255), "Oscillation Area")
 
                             # Visualization of active User Fixed ROI (even when not setting)
                             if self.app.tracker and self.app.tracker.tracking_mode == "USER_FIXED_ROI" and \

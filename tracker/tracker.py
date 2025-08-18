@@ -222,6 +222,12 @@ class ROITracker:
         # --- DOT Tracker state ---
         self.dot_smoothed_xy: Optional[Tuple[float, float]] = None
         self.dot_last_detected_xy: Optional[Tuple[int, int]] = None
+        self.dot_selected_x: Optional[int] = None  # user-selected column
+        self.dot_hsv_sample: Optional[Tuple[int, int, int]] = None  # sampled HSV at selection
+        # Boundary rectangle (in processed frame coordinates) within which dot detection is allowed
+        self.dot_boundary_rect: Optional[Tuple[int, int, int, int]] = None  # (x, y, w, h)
+        # Whether to draw the boundary overlay during dot tracking
+        self.show_dot_boundary: bool = True
         self.oscillation_last_known_secondary_pos = 50.0
         self.oscillation_last_active_time = 0
         self.oscillation_hold_duration_ms = 200  # Hold for 200ms before decaying
@@ -565,6 +571,12 @@ class ROITracker:
         self.prev_features_main_roi = None
         self.penis_last_known_box = None
         self.main_interaction_class = None
+
+        # Clear Dot Tracker boundary/selection overlays (does not clear caches since not cached yet)
+        if self.dot_boundary_rect is not None or self.dot_selected_x is not None:
+            self.logger.info(f"Clearing dot overlays: boundary={self.dot_boundary_rect}, selected_x={self.dot_selected_x}")
+        self.dot_boundary_rect = None
+        # Do not clear dot_hsv_sample here; only visuals. Sampling remains until reset or explicit change.
 
     def reconfigure_for_chapter(self, chapter):  # video_segment.VideoSegment
         """Reconfigures the tracker using ROI data from a chapter."""
@@ -1501,6 +1513,64 @@ class ROITracker:
         self.internal_frame_counter += 1
         return processed_frame, action_log_list if action_log_list else None
 
+    def set_dot_initial_point(self, x_abs: int, y_abs: int, frame: Optional[np.ndarray] = None) -> None:
+        """Set the initial dot point by user click.
+        Expects coordinates in the processed frame space (after preprocess_frame letterboxing).
+        If a raw frame is provided, the method will preprocess it for consistent sampling.
+        Stores the selected column (x) and samples HSV at a small patch to drive adaptive masking.
+        """
+        try:
+            if frame is not None and frame.size > 0:
+                proc = self.preprocess_frame(frame)
+            else:
+                # If no frame, we cannot sample HSV; we can still lock x
+                proc = None
+            self.dot_selected_x = int(x_abs)
+            if proc is not None:
+                ph, pw = proc.shape[:2]
+                x = int(np.clip(x_abs, 0, pw - 1))
+                y = int(np.clip(y_abs, 0, ph - 1))
+                hsv = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
+                # Sample a small 5x5 neighborhood median to be robust
+                x1 = max(0, x - 2); x2 = min(pw - 1, x + 2)
+                y1 = max(0, y - 2); y2 = min(ph - 1, y + 2)
+                patch = hsv[y1:y2 + 1, x1:x2 + 1]
+                if patch.size > 0:
+                    sh = int(np.median(patch[..., 0]))
+                    ss = int(np.median(patch[..., 1]))
+                    sv = int(np.median(patch[..., 2]))
+                    self.dot_hsv_sample = (sh, ss, sv)
+                else:
+                    self.dot_hsv_sample = None
+            # Reset smoothing so the tracker settles quickly on the new point
+            self.dot_smoothed_xy = None
+            self.dot_last_detected_xy = None
+            self.logger.info(f"Dot initial point set at x={self.dot_selected_x}, hsv_sample={self.dot_hsv_sample}")
+        except Exception as e:
+            self.logger.error(f"Failed to set dot initial point: {e}")
+
+    def set_dot_boundary(self, rect_abs: Optional[Tuple[int, int, int, int]]) -> None:
+        """Set or clear the dot detection boundary rectangle in processed-frame coordinates.
+        Pass None to clear. Rect is (x, y, w, h). Values will be clamped to current target size lazily at use time.
+        """
+        self.dot_boundary_rect = rect_abs
+        if rect_abs is None:
+            self.logger.info("Dot boundary cleared.")
+        else:
+            x, y, w, h = rect_abs
+            self.logger.info(f"Dot boundary set to (x={x}, y={y}, w={w}, h={h}).")
+
+    def set_dot_boundary_and_point(self, rect_abs: Tuple[int, int, int, int], point_abs: Tuple[int, int], frame: Optional[np.ndarray]) -> None:
+        """Convenience: set boundary and initial dot point together.
+        Expects processed-frame coordinates for both.
+        """
+        try:
+            self.set_dot_boundary(rect_abs)
+            if point_abs is not None:
+                self.set_dot_initial_point(point_abs[0], point_abs[1], frame)
+        except Exception as e:
+            self.logger.error(f"Failed to set dot boundary and point: {e}")
+
     def process_frame_for_dot_tracker(self, frame: np.ndarray, frame_time_ms: int, frame_index: Optional[int] = None) -> Tuple[np.ndarray, Optional[List[Dict]]]:
         """Detect and track a bright dot and output normalized positions.
         - Uses HSV thresholding for bright dot isolation
@@ -1524,16 +1594,63 @@ class ROITracker:
         min_brightness = int(get('dot_min_brightness', 180))
         alpha = float(get('dot_smoothing_alpha', 0.3))
         overlay_enabled = bool(get('dot_overlay_enabled', True))
+        lock_horizontal = bool(get('dot_lock_horizontal', True))
+        search_half_w = int(get('dot_search_half_width', 24))
+        hue_tol = int(get('dot_hue_tol', 12))
+        sat_tol = int(get('dot_sat_tol', 80))
+        val_tol = int(get('dot_val_tol', 80))
 
         # Preprocess and convert
         processed_frame = self.preprocess_frame(frame)
         hsv = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2HSV)
         h, w = processed_frame.shape[:2]
 
-        # Threshold bright regions
-        lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
-        upper = np.array([h_high, s_high, v_high], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
+        # Build mask
+        if self.dot_hsv_sample is not None:
+            sh, ss, sv = self.dot_hsv_sample
+            # Tolerant range around sampled HSV; handle hue wrap-around in 0..179
+            h1 = (sh - hue_tol) % 180
+            h2 = (sh + hue_tol) % 180
+            s1 = max(0, ss - sat_tol); s2 = min(255, ss + sat_tol)
+            v1 = max(0, sv - val_tol); v2 = min(255, sv + val_tol)
+            if h1 <= h2:
+                lower1 = np.array([h1, s1, v1], dtype=np.uint8)
+                upper1 = np.array([h2, s2, v2], dtype=np.uint8)
+                mask_h = cv2.inRange(hsv, lower1, upper1)
+            else:
+                # Wrap-around: combine two ranges [0,h2] U [h1,179]
+                lower_a = np.array([0, s1, v1], dtype=np.uint8)
+                upper_a = np.array([h2, s2, v2], dtype=np.uint8)
+                lower_b = np.array([h1, s1, v1], dtype=np.uint8)
+                upper_b = np.array([179, s2, v2], dtype=np.uint8)
+                mask_h = cv2.bitwise_or(cv2.inRange(hsv, lower_a, upper_a), cv2.inRange(hsv, lower_b, upper_b))
+            mask = mask_h
+        else:
+            # Fallback to static bright-ish mask
+            lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
+            upper = np.array([h_high, s_high, v_high], dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+
+        # If user selected a column, restrict to vertical band
+        if self.dot_selected_x is not None and search_half_w > 0:
+            band_mask = np.zeros_like(mask)
+            x1 = max(0, int(self.dot_selected_x) - search_half_w)
+            x2 = min(w - 1, int(self.dot_selected_x) + search_half_w)
+            band_mask[:, x1:x2 + 1] = 255
+            mask = cv2.bitwise_and(mask, band_mask)
+
+        # If boundary rectangle is set, restrict mask to that region
+        if self.dot_boundary_rect is not None:
+            bx, by, bw, bh = self.dot_boundary_rect
+            # Clamp to frame bounds
+            bx = max(0, bx); by = max(0, by)
+            bw = max(0, min(bw, w - bx))
+            bh = max(0, min(bh, h - by))
+            if bw > 0 and bh > 0:
+                bmask = np.zeros_like(mask)
+                bmask[by:by + bh, bx:bx + bw] = 255
+                mask = cv2.bitwise_and(mask, bmask)
+
         # Morphology to clean noise
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -1612,15 +1729,53 @@ class ROITracker:
             cur_xy = self.dot_last_detected_xy
 
         # Overlay
-        if overlay_enabled and cur_xy is not None:
-            cv2.circle(processed_frame, cur_xy, 5, RGBColors.GREEN, 2)
-            cv2.circle(processed_frame, cur_xy, 2, RGBColors.RED, -1)
-            cv2.putText(processed_frame, f"Dot {cur_xy}", (cur_xy[0] + 6, cur_xy[1] - 6), cv2.FONT_HERSHEY_PLAIN, 0.8, RGBColors.GREEN, 1)
+        if overlay_enabled:
+            if self.dot_selected_x is not None:
+                x1 = max(0, int(self.dot_selected_x) - search_half_w)
+                x2 = min(w - 1, int(self.dot_selected_x) + search_half_w)
+                # Draw optional vertical guides for the search band only if enabled
+                if getattr(self, 'show_dot_guides', False):
+                    cv2.line(processed_frame, (x1, 0), (x1, h - 1), RGBColors.GREY, 1)
+                    cv2.line(processed_frame, (x2, 0), (x2, h - 1), RGBColors.GREY, 1)
+            # Draw boundary rectangle if enabled
+            if self.dot_boundary_rect is not None and getattr(self, 'show_dot_boundary', True):
+                bx, by, bw, bh = self.dot_boundary_rect
+                bx = max(0, bx); by = max(0, by)
+                bw = max(0, min(bw, w - bx))
+                bh = max(0, min(bh, h - by))
+                if bw > 0 and bh > 0:
+                    cv2.rectangle(processed_frame, (bx, by), (bx + bw, by + bh), RGBColors.YELLOW, 1)
+            if cur_xy is not None:
+                cv2.circle(processed_frame, cur_xy, 5, RGBColors.GREEN, 2)
+                cv2.circle(processed_frame, cur_xy, 2, RGBColors.RED, -1)
+                cv2.putText(processed_frame, f"Dot {cur_xy}", (cur_xy[0] + 6, cur_xy[1] - 6), cv2.FONT_HERSHEY_PLAIN, 0.8, RGBColors.GREEN, 1)
 
         # Normalize to 0-100; if no detection, hold last value or default to center
         if cur_xy is not None:
-            x_norm = int(np.clip(100.0 * (cur_xy[0] / max(1.0, float(w))), 0, 100))
-            y_norm = int(np.clip(100.0 * (1.0 - (cur_xy[1] / max(1.0, float(h)))), 0, 100))
+            if lock_horizontal and self.dot_selected_x is not None:
+                x_use = int(self.dot_selected_x)
+            else:
+                x_use = cur_xy[0]
+            # If a dot boundary is defined, normalize within it; otherwise use full frame
+            if self.dot_boundary_rect is not None:
+                bx, by, bw, bh = self.dot_boundary_rect
+                # Clamp to frame bounds and ensure positive sizes
+                bx = max(0, bx); by = max(0, by)
+                bw = max(0, min(bw, w - bx))
+                bh = max(0, min(bh, h - by))
+                if bw > 0 and bh > 0:
+                    # Normalize within boundary; keep vertical orientation (top=100, bottom=0)
+                    x_rel = float(x_use - bx)
+                    y_rel = float(cur_xy[1] - by)
+                    x_norm = int(np.clip(100.0 * (x_rel / max(1.0, float(bw))), 0, 100))
+                    y_norm = int(np.clip(100.0 * (1.0 - (y_rel / max(1.0, float(bh)))), 0, 100))
+                else:
+                    # Fallback to full-frame normalization if boundary invalid
+                    x_norm = int(np.clip(100.0 * (x_use / max(1.0, float(w))), 0, 100))
+                    y_norm = int(np.clip(100.0 * (1.0 - (cur_xy[1] / max(1.0, float(h)))), 0, 100))
+            else:
+                x_norm = int(np.clip(100.0 * (x_use / max(1.0, float(w))), 0, 100))
+                y_norm = int(np.clip(100.0 * (1.0 - (cur_xy[1] / max(1.0, float(h)))), 0, 100))
         else:
             x_norm, y_norm = 50, 50
 
@@ -1836,6 +1991,13 @@ class ROITracker:
 
         # Clear video source status on reset
         self._last_video_source_status = None
+
+        # --- Clear DOT tracker state ---
+        self.dot_boundary_rect = None
+        self.dot_selected_x = None
+        self.dot_hsv_sample = None
+        self.dot_smoothed_xy = None
+        self.dot_last_detected_xy = None
 
     def _check_and_report_video_source_status(self) -> None:
         """
