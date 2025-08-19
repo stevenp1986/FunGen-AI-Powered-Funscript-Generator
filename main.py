@@ -76,7 +76,8 @@ def main():
     # Step 2: Perform dependency check before importing anything else
     try:
         from application.utils.dependency_checker import check_and_install_dependencies
-        check_and_install_dependencies()
+        # Do not auto-install during local test runs; fail fast with guidance instead
+        check_and_install_dependencies(non_interactive=True, auto_install=False)
     except ImportError as e:
         logger.error(f"Failed to import dependency checker: {e}")
         logger.error("Please ensure the file 'application/utils/dependency_checker.py' exists.")

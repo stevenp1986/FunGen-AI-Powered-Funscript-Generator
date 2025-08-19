@@ -35,8 +35,9 @@ def temp_output_dir():
 def run_cli_smoke_test(video_path: str, mode: str, output_dir: str, timeout: int = 300) -> bool:
     """Run CLI processing as smoke test with short timeout."""
     
+    repo_root = Path(__file__).resolve().parents[2]
     cmd = [
-        'python', 'main.py',
+        sys.executable, 'main.py',
         video_path,
         '--mode', mode,
         '--overwrite'  # Force processing to ensure clean test
@@ -52,7 +53,7 @@ def run_cli_smoke_test(video_path: str, mode: str, output_dir: str, timeout: int
             text=True,
             timeout=timeout,
             env=env,
-            cwd="/Users/k00gar/PycharmProjects/VR-Funscript-AI-Generator"
+            cwd=str(repo_root)
         )
         
         if result.returncode != 0:
@@ -113,8 +114,9 @@ class TestSmokeTests:
         os.makedirs(test_folder)
         shutil.copy2(BATCH_TEST_VIDEOS[0], test_folder)
         
+        repo_root = Path(__file__).resolve().parents[2]
         cmd = [
-            'python', 'main.py',
+            sys.executable, 'main.py',
             test_folder,
             '--mode', '2-stage',
             '--overwrite'
@@ -124,7 +126,7 @@ class TestSmokeTests:
         env['FUNGEN_TESTING'] = '1'
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env,
-                              cwd="/Users/k00gar/PycharmProjects/VR-Funscript-AI-Generator")
+                              cwd=str(repo_root))
         
         assert result.returncode == 0, f"Batch 2-stage smoke test failed: {result.stderr}"
     
@@ -140,8 +142,9 @@ class TestSmokeTests:
         os.makedirs(test_folder)
         shutil.copy2(BATCH_TEST_VIDEOS[0], test_folder)
         
+        repo_root = Path(__file__).resolve().parents[2]
         cmd = [
-            'python', 'main.py',
+            sys.executable, 'main.py',
             test_folder,
             '--mode', '3-stage',
             '--overwrite'
@@ -151,7 +154,7 @@ class TestSmokeTests:
         env['FUNGEN_TESTING'] = '1'
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env,
-                              cwd="/Users/k00gar/PycharmProjects/VR-Funscript-AI-Generator")
+                              cwd=str(repo_root))
         
         assert result.returncode == 0, f"Batch 3-stage smoke test failed: {result.stderr}"
     
@@ -167,8 +170,9 @@ class TestSmokeTests:
         os.makedirs(test_folder)
         shutil.copy2(BATCH_TEST_VIDEOS[0], test_folder)
         
+        repo_root = Path(__file__).resolve().parents[2]
         cmd = [
-            'python', 'main.py',
+            sys.executable, 'main.py',
             test_folder,
             '--mode', 'oscillation-detector',
             '--overwrite'
@@ -178,7 +182,7 @@ class TestSmokeTests:
         env['FUNGEN_TESTING'] = '1'
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env,
-                              cwd="/Users/k00gar/PycharmProjects/VR-Funscript-AI-Generator")
+                              cwd=str(repo_root))
         
         assert result.returncode == 0, f"Batch oscillation detector smoke test failed: {result.stderr}"
 

@@ -629,6 +629,13 @@ class GUI:
 
         current_action_count = len(self.app.funscript_processor.get_actions('primary'))
         is_live_tracking = self.app.processor and self.app.processor.tracker and self.app.processor.tracker.tracking_active
+        # In Beat Marker mode we want immediate preview updates; bypass live throttling
+        is_beat_marker_mode = False
+        try:
+            if self.app.processor and self.app.processor.tracker:
+                is_beat_marker_mode = (self.app.processor.tracker.tracking_mode == "BEAT_MARKER")
+        except Exception:
+            is_beat_marker_mode = False
 
         # Determine if a redraw is needed
         full_redraw_needed = (app_state.funscript_preview_dirty
@@ -639,13 +646,39 @@ class GUI:
 
         # For this async model, we always do a full redraw. Incremental drawing is complex with threading.
         # The performance gain from async outweighs the loss of incremental drawing.
-        needs_regen = (full_redraw_needed
-            or (incremental_update_needed
-            and (not is_live_tracking
-            or (time.time() - self.last_preview_update_time_timeline >= self.preview_update_interval_seconds))))
+        needs_regen = (
+            full_redraw_needed
+            or (
+                incremental_update_needed
+                and (
+                    # Always allow immediate updates in Beat Marker mode
+                    is_beat_marker_mode
+                    or (not is_live_tracking)
+                    or (time.time() - self.last_preview_update_time_timeline >= self.preview_update_interval_seconds)
+                )
+            )
+        )
 
-        # Non-blocking submit: try_put; if queue full, skip this frame without blocking UI
-        if needs_regen:
+        # Lightweight diagnostics for Beat Marker mode
+        if is_beat_marker_mode:
+            try:
+                tracking_mode_str = self.app.processor.tracker.tracking_mode if (self.app.processor and self.app.processor.tracker) else "N/A"
+            except Exception:
+                tracking_mode_str = "ERR"
+            try:
+                self.app.logger.info(
+                    f"BM: needs_regen={needs_regen} dirty={app_state.funscript_preview_dirty} "
+                    f"size_changed={current_bar_width_int != app_state.last_funscript_preview_bar_width} "
+                    f"dur_changed={abs(total_duration_s - app_state.last_funscript_preview_duration_s) > 0.01} "
+                    f"actions={current_action_count} last_actions={self.last_submitted_action_count_timeline} "
+                    f"tracking_mode={tracking_mode_str}"
+                )
+            except Exception:
+                pass
+
+        # Non-blocking submit: In Beat Marker mode use synchronous generation only.
+        # Otherwise, try async; if queue is full, keep dirty flag so we retry next frame.
+        if needs_regen and not is_beat_marker_mode:
             actions_copy = self.app.funscript_processor.get_actions('primary').copy()
             task = {
                 'type': 'timeline',
@@ -654,23 +687,69 @@ class GUI:
                 'total_duration_s': total_duration_s,
                 'actions': actions_copy
             }
+            submitted = False
             try:
                 self.preview_task_queue.put_nowait(task)
+                submitted = True
             except queue.Full:
-                pass
+                submitted = False
 
-            # Update state after submission
-            app_state.funscript_preview_dirty = False
-            app_state.last_funscript_preview_bar_width = current_bar_width_int
-            app_state.last_funscript_preview_duration_s = total_duration_s
-            self.last_submitted_action_count_timeline = current_action_count
-            if is_live_tracking and incremental_update_needed:
-                self.last_preview_update_time_timeline = time.time()
+            if submitted:
+                # Update state only after a successful submission
+                app_state.funscript_preview_dirty = False
+                app_state.last_funscript_preview_bar_width = current_bar_width_int
+                app_state.last_funscript_preview_duration_s = total_duration_s
+                self.last_submitted_action_count_timeline = current_action_count
+                if is_live_tracking and incremental_update_needed:
+                    self.last_preview_update_time_timeline = time.time()
+                try:
+                    self.app.logger.debug(f"Timeline async submit {current_bar_width_int}x{graph_height} actions={len(actions_copy)}")
+                except Exception:
+                    pass
+            else:
+                # Keep dirty flag; retry next frame
+                try:
+                    self.app.logger.debug("Timeline async submit skipped (queue full)")
+                except Exception:
+                    pass
 
         # --- Rendering Logic (uses the existing texture until a new one is ready) ---
         imgui.set_cursor_pos_y(imgui.get_cursor_pos_y() + 20)
         canvas_p1_x = imgui.get_cursor_screen_pos()[0]
         canvas_p1_y_offset = imgui.get_cursor_screen_pos()[1]
+
+        # If in Beat Marker mode and a regen is needed, generate synchronously to avoid async delays
+        if is_beat_marker_mode and needs_regen:
+            try:
+                t0 = time.perf_counter()
+                actions_copy_sync = self.app.funscript_processor.get_actions('primary').copy()
+                image_data_sync = self._generate_funscript_preview_data(
+                    current_bar_width_int,
+                    graph_height,
+                    total_duration_s,
+                    actions_copy_sync
+                )
+                self.update_texture(self.funscript_preview_texture_id, image_data_sync)
+                # Force GPU to process the texture upload immediately
+                try:
+                    gl.glFlush()
+                except Exception:
+                    pass
+                t1 = time.perf_counter()
+                # Update state after successful sync update
+                app_state.funscript_preview_dirty = False
+                app_state.last_funscript_preview_bar_width = current_bar_width_int
+                app_state.last_funscript_preview_duration_s = total_duration_s
+                self.last_submitted_action_count_timeline = current_action_count
+                try:
+                    self.app.logger.info(
+                        f"BM: sync preview updated in {(t1 - t0)*1000:.1f}ms | size={current_bar_width_int}x{graph_height} "
+                        f"actions={len(actions_copy_sync)}"
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                self.app.logger.error(f"Synchronous timeline preview generation failed: {e}", exc_info=True)
 
         imgui.image(self.funscript_preview_texture_id, current_bar_width_float, graph_height, uv0=(0, 0), uv1=(1, 1))
 

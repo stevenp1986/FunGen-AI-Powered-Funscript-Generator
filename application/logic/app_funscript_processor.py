@@ -569,7 +569,13 @@ class AppFunscriptProcessor:
 
         if timeline_num == 1:
             self.app.app_state_ui.heatmap_dirty = True
+        # Always mark the funscript preview dirty so the preview regenerates for T1 and T2 changes
+        try:
             self.app.app_state_ui.funscript_preview_dirty = True
+            self.logger.debug(f"Marked funscript_preview_dirty due to T{timeline_num} change: {change_description}")
+        except Exception:
+            # Be resilient in case app_state_ui is not initialized yet
+            pass
 
         # Clear selection if it was for the timeline/axis that just changed
         current_timeline_num_for_selection = 1 if self.selected_axis_for_processing == 'primary' else 2

@@ -89,6 +89,7 @@ class TrackerMode(Enum):
     OFFLINE_3_STAGE = "Offline - YOLO AI + Opt. Flow (3 Stages)"                # 5 
     OFFLINE_3_STAGE_MIXED = "Offline - YOLO AI + Mixed Flow (3 Stages Mixed)"   # 6
     DOT_TRACKER = "Live - Dot Tracker (Manual point)"                            # 7
+    BEAT_MARKER = "Live - Beat Marker (Visual/Audio)"                            # 8
 
 DEFAULT_TRACKER_MODE = 0
 
@@ -145,7 +146,7 @@ DEFAULT_UI_LAYOUT = "fixed"  # "fixed" or "floating"
 
 # --- UI Behavior ---
 MAX_HISTORY_DISPLAY = 10  # Max number of actions to show in the Undo/Redo history display.
-UI_PREVIEW_UPDATE_INTERVAL_S = 1.0  # Interval for updating graphs during live tracking.
+UI_PREVIEW_UPDATE_INTERVAL_S = 0.5  # Interval for updating graphs during live tracking.
 DEFAULT_CHAPTER_BAR_HEIGHT = 20  # Height in pixels of the chapter bar.
 
 # --- Timeline & Heatmap Colors (now imported from constants_colors.py) ---

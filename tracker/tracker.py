@@ -532,7 +532,7 @@ class ROITracker:
         return overall_dy, overall_dx, lower_magnitude, upper_magnitude, flow
 
     def set_tracking_mode(self, mode: str):
-        if mode in ["YOLO_ROI", "USER_FIXED_ROI", "OSCILLATION_DETECTOR", "OSCILLATION_DETECTOR_LEGACY", "DOT_TRACKER"]:
+        if mode in ["YOLO_ROI", "USER_FIXED_ROI", "OSCILLATION_DETECTOR", "OSCILLATION_DETECTOR_LEGACY", "DOT_TRACKER", "BEAT_MARKER"]:
             if self.tracking_mode != mode:
                 previous_mode = self.tracking_mode
                 # Before switching, update caches from current state
@@ -1185,6 +1185,8 @@ class ROITracker:
             return self.process_frame_for_oscillation_legacy(frame, frame_time_ms, frame_index)
         elif self.tracking_mode == "DOT_TRACKER":
             return self.process_frame_for_dot_tracker(frame, frame_time_ms, frame_index)
+        elif self.tracking_mode == "BEAT_MARKER":
+            return self.process_frame_for_beat_marker(frame, frame_time_ms, frame_index)
 
         self._update_fps()
         processed_frame = self.preprocess_frame(frame)
@@ -1460,7 +1462,14 @@ class ROITracker:
                 effective_delay_ms = 0.0
 
             # Adjust the timestamp with the effective delay
-            adjusted_frame_time_ms = frame_time_ms - effective_delay_ms
+            # Apply optional constant audio latency compensation
+            extra_latency_ms = 0.0
+            try:
+                if source == 'audio' and audio_latency_ms_cfg != 0.0:
+                    extra_latency_ms = float(audio_latency_ms_cfg)
+            except Exception:
+                pass
+            adjusted_frame_time_ms = frame_time_ms - (effective_delay_ms + extra_latency_ms)
 
             is_file_processing_context = frame_index is not None
 
@@ -1511,6 +1520,410 @@ class ROITracker:
                 cv2.putText(processed_frame, stat_text, (5, 15 + i * 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, RGBColors.TEAL, 1)
 
         self.internal_frame_counter += 1
+        return processed_frame, action_log_list if action_log_list else None
+
+    def process_frame_for_beat_marker(self, frame: np.ndarray, frame_time_ms: int, frame_index: Optional[int] = None) -> Tuple[np.ndarray, Optional[List[Dict]]]:
+        """Minimal visual ROI-based beat detector.
+        - Computes mean brightness over a small center patch
+        - Uses z-score threshold with hysteresis and min interval
+        - Emits step-wave beat positions (toggle between min/max)
+        """
+        self._update_fps()
+        processed_frame = self.preprocess_frame(frame)
+
+        # Settings
+        app = self.app
+        get = app.app_settings.get if (app and hasattr(app, 'app_settings')) else (lambda k, d=None: d)
+        # Normalize string settings to avoid case-sensitivity issues from UI (e.g., "Step" vs "step")
+        source = str(get("beat_source", "visual")).strip().lower()
+        bpm = float(get("beat_bpm", 120))
+        subdivision = max(1, int(get("beat_subdivision", 1)))
+        amp_min = int(get("beat_amp_min", 10))
+        amp_max = int(get("beat_amp_max", 90))
+        waveform = str(get("beat_waveform", "step")).strip().lower()
+        thr_sigma = float(get("beat_threshold_sigma", 2.0))
+        hyster_ratio = float(get("beat_hysteresis_ratio", 0.6))
+        min_interval_ms = float(get("beat_min_interval_ms", 250))
+        swing_pct = float(get("beat_swing_percent", 0.0))  # 0-50
+        phase_deg = float(get("beat_phase_deg", 0.0))
+        # Additional audio-specific settings
+        deriv_sigma = float(get("beat_deriv_sigma", 0.5))  # gating on novelty derivative (lenient default)
+        thr_mode = str(get("beat_threshold_mode", "sigma")).strip().lower()  # 'sigma' or 'percentile'
+        thr_percentile = float(get("beat_threshold_percentile", 90.0))  # used when thr_mode == 'percentile'
+        audio_latency_ms_cfg = float(get("beat_audio_latency_ms", 0.0))  # compensate constant latency
+        # Absolute novelty threshold override (envelope - EMA); helps detect clear short spikes
+        novelty_abs_thr = float(get("beat_audio_abs_novelty_thr", 0.3))
+
+        # Clamp/sanitize amplitude inputs and handle swapped values
+        amp_min = max(0, min(100, amp_min))
+        amp_max = max(0, min(100, amp_max))
+        if amp_min > amp_max:
+            amp_min, amp_max = amp_max, amp_min
+
+        # Compute derived beat interval from BPM/subdivision for metronome source only
+        if source == "metronome" and bpm > 0:
+            beat_period_ms = (60000.0 / bpm) / subdivision
+            min_interval_ms = max(min_interval_ms, 0.5 * beat_period_ms)
+
+        action_log_list: List[Dict] = []
+
+        # Measure source signal: visual brightness over patch OR audio envelope
+        signal = 0.0
+        x1 = y1 = x2 = y2 = 0  # for visual overlay only
+        if source == "visual":
+            gray = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape[:2]
+            use_user_roi = (bool(get("beat_use_user_roi", False)) and getattr(self, 'user_roi_fixed', None))
+            if use_user_roi and self.user_roi_fixed is not None:
+                rx, ry, rw, rh = self.user_roi_fixed
+                if rw > 2 and rh > 2:
+                    x1 = max(0, min(w - 1, rx))
+                    y1 = max(0, min(h - 1, ry))
+                    x2 = max(x1 + 1, min(w, rx + rw))
+                    y2 = max(y1 + 1, min(h, ry + rh))
+                    patch = gray[y1:y2, x1:x2]
+                else:
+                    use_user_roi = False
+            if not use_user_roi:
+                patch_size = 64
+                cx, cy = w // 2, h // 2
+                x1 = max(0, cx - patch_size // 2)
+                y1 = max(0, cy - patch_size // 2)
+                x2 = min(w, x1 + patch_size)
+                y2 = min(h, y1 + patch_size)
+                patch = gray[y1:y2, x1:x2]
+            signal = float(np.mean(patch)) if patch.size > 0 else 0.0
+        elif source == "audio":
+            # Query audio envelope at current media time
+            if hasattr(self.app, 'processor') and self.app.processor is not None:
+                try:
+                    signal = float(self.app.processor.get_audio_envelope_value(frame_time_ms))
+                except Exception as e:
+                    self.logger.warning(f"Audio envelope unavailable: {e}")
+                    signal = 0.0
+            else:
+                signal = 0.0
+            # Build EMA baseline and novelty for robust click detection
+            try:
+                if not hasattr(self, 'beat_audio_env_history'):
+                    from collections import deque
+                    self.beat_audio_env_history = deque(maxlen=400)
+                if not hasattr(self, 'beat_audio_novelty_history'):
+                    from collections import deque
+                    self.beat_audio_novelty_history = deque(maxlen=200)
+                # EMA smoothing factor (configurable)
+                get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
+                ema_alpha = float(get('beat_audio_ema_alpha', 0.2))
+                ema_alpha = max(0.01, min(0.9, ema_alpha))
+                # Update EMA
+                if getattr(self, 'beat_audio_ema', None) is None:
+                    self.beat_audio_ema = float(signal)
+                else:
+                    self.beat_audio_ema = (1.0 - ema_alpha) * float(self.beat_audio_ema) + ema_alpha * float(signal)
+                novelty = max(0.0, float(signal) - float(self.beat_audio_ema))
+                self.beat_audio_env_history.append(float(signal))
+                self.beat_audio_novelty_history.append(float(novelty))
+                # Track derivative of novelty (onset detector)
+                prev_nov = getattr(self, 'beat_audio_last_novelty', None)
+                if prev_nov is None:
+                    self.beat_audio_last_novelty = float(novelty)
+                    novelty_deriv = 0.0
+                else:
+                    novelty_deriv = float(novelty) - float(prev_nov)
+                    self.beat_audio_last_novelty = float(novelty)
+            except Exception:
+                novelty = max(0.0, float(signal))
+                novelty_deriv = 0.0
+
+        # Update signal history for z-score (reuse existing buffer name for simplicity)
+        if not hasattr(self, 'beat_brightness_history') or self.beat_brightness_history.maxlen is None:
+            from collections import deque
+            self.beat_brightness_history = deque(maxlen=60)
+        self.beat_brightness_history.append(signal)
+
+        # Stats baseline (default: raw signal history)
+        avg = float(np.mean(self.beat_brightness_history)) if len(self.beat_brightness_history) > 0 else signal
+        std = float(np.std(self.beat_brightness_history)) if len(self.beat_brightness_history) > 1 else 0.0
+        z = (signal - avg) / (std + 1e-6)
+        # For audio: prefer novelty-based z scoring. During warmup (few samples), use mean/std on novelty history.
+        if source == 'audio':
+            try:
+                nov_hist = list(getattr(self, 'beat_audio_novelty_history', []))
+                if 3 <= len(nov_hist) < 15:
+                    n_avg = float(np.mean(nov_hist))
+                    n_std = float(np.std(nov_hist))
+                    z = (float(locals().get('novelty', 0.0)) - n_avg) / (n_std + 1e-6)
+            except Exception:
+                pass
+            # For audio source, compute robust statistics on novelty and its derivative when enough history exists
+            try:
+                nov_hist = list(getattr(self, 'beat_audio_novelty_history', []))
+                if len(nov_hist) >= 15:
+                    med = float(np.median(nov_hist))
+                    mad = float(np.median(np.abs(np.array(nov_hist) - med)))
+                    robust_scale = (1.4826 * mad) + 1e-6
+                    z = (float(novelty) - med) / robust_scale
+                    # Derivative threshold in same robust scale
+                    deriv_hist = np.diff(np.array(nov_hist, dtype=float))
+                    if deriv_hist.size >= 8:
+                        dmed = float(np.median(deriv_hist))
+                        dmad = float(np.median(np.abs(deriv_hist - dmed)))
+                        dscale = (1.4826 * dmad) + 1e-6
+                    else:
+                        dscale = robust_scale
+                    z_deriv = float(novelty_deriv) / dscale
+                else:
+                    # Fallback to mean/std if not enough history
+                    z_deriv = 0.0
+            except Exception:
+                z_deriv = 0.0
+
+        # Hysteresis + interval gating
+        now_ms = frame_time_ms
+        last_ms = self.beat_last_tick_time_ms if hasattr(self, 'beat_last_tick_time_ms') else None
+        interval_ok = (last_ms is None) or ((now_ms - last_ms) >= min_interval_ms)
+
+        # Diagnostic logging for audio source to trace why triggers may not occur
+        if source == "audio":
+            try:
+                if not hasattr(self, 'last_audio_env_dbg_log_ms'):
+                    self.last_audio_env_dbg_log_ms = 0
+                if (now_ms - self.last_audio_env_dbg_log_ms) >= 250:
+                    ema_dbg = getattr(self, 'beat_audio_ema', None)
+                    nov_dbg = locals().get('novelty', None)
+                    self.logger.info(
+                        f"BeatMarker(audio) sig={signal:.3f} ema={(ema_dbg if ema_dbg is None else float(ema_dbg)):.3f} "
+                        f"nov={(0.0 if nov_dbg is None else float(nov_dbg)):.3f} avg={avg:.3f} std={std:.3f} z={z:.2f} "
+                        f"thr={thr_sigma:.2f} hyst={hyster_ratio:.2f} armed={getattr(self, 'beat_armed', True)} "
+                        f"interval_ok={interval_ok} dt_since_last={(0 if last_ms is None else (now_ms - last_ms)):.0f} "
+                        f"min_interval={min_interval_ms:.0f}ms"
+                    )
+                    self.last_audio_env_dbg_log_ms = now_ms
+            except Exception:
+                pass
+
+        triggered = False
+        if source == "visual":
+            if getattr(self, 'beat_armed', True) and z >= thr_sigma and interval_ok:
+                triggered = True
+                self.beat_armed = False
+                self.beat_last_tick_time_ms = now_ms
+            # Re-arm condition
+            if not getattr(self, 'beat_armed', True) and z <= (thr_sigma * hyster_ratio):
+                self.beat_armed = True
+        elif source == "audio":
+            # Determine base threshold either from sigma or percentile on novelty (secondary criterion)
+            local_thr = thr_sigma
+            local_thr_low = thr_sigma * hyster_ratio
+            try:
+                if thr_mode == 'percentile':
+                    nov_hist = list(getattr(self, 'beat_audio_novelty_history', []))
+                    if len(nov_hist) >= 25:
+                        base = float(np.percentile(nov_hist, max(50.0, min(99.9, thr_percentile))))
+                        # Convert to robust z threshold relative to current median/mad if available
+                        med = float(np.median(nov_hist))
+                        mad = float(np.median(np.abs(np.array(nov_hist) - med)))
+                        scale = (1.4826 * mad) + 1e-6
+                        local_thr = (base - med) / scale
+                        local_thr_low = local_thr * hyster_ratio
+            except Exception:
+                pass
+
+            # Primary criterion: absolute novelty above threshold (strong onset)
+            try:
+                abs_nov = float(locals().get('novelty', 0.0))
+            except Exception:
+                abs_nov = 0.0
+            # Rising edge via derivative (use robust z-deriv if available else raw novelty_deriv)
+            z_ok = (z >= local_thr)
+            deriv_ok = True
+            try:
+                deriv_ok = (z_deriv >= max(0.0, deriv_sigma))
+            except Exception:
+                # Fallback to raw novelty derivative
+                try:
+                    deriv_ok = (float(locals().get('novelty_deriv', 0.0)) >= max(0.0, deriv_sigma * 0.1))
+                except Exception:
+                    deriv_ok = True
+
+            # Trigger logic:
+            # - Primary: absolute novelty above threshold with interval gating (no derivative requirement).
+            # - Secondary: robust z + derivative + interval gating.
+            if getattr(self, 'beat_armed', True) and (
+                ((abs_nov >= max(0.0, novelty_abs_thr)) and interval_ok) or
+                ((z_ok and deriv_ok) and interval_ok)
+            ):
+                triggered = True
+                self.beat_armed = False
+                self.beat_last_tick_time_ms = now_ms
+            # Re-arm conditions: low novelty or z below low threshold
+            if not getattr(self, 'beat_armed', True) and (abs_nov <= max(0.0, novelty_abs_thr) * 0.5 or z <= local_thr_low):
+                self.beat_armed = True
+            # Fail-safe: if not re-armed by hysteresis after a while, re-arm by time to allow next beat
+            if not getattr(self, 'beat_armed', True):
+                last_ms_fs = self.beat_last_tick_time_ms if hasattr(self, 'beat_last_tick_time_ms') else None
+                if (last_ms_fs is not None) and ((now_ms - last_ms_fs) >= (min_interval_ms * 1.2)):
+                    self.beat_armed = True
+        elif source == "metronome" and bpm > 0:
+            # Initialize next tick lazily with phase offset
+            if getattr(self, 'beat_next_tick_time_ms', None) is None:
+                phase_frac = (phase_deg / 360.0)
+                base_interval = (60000.0 / bpm) / subdivision
+                phase_offset_ms = phase_frac * base_interval
+                self.beat_next_tick_time_ms = now_ms + max(0.0, phase_offset_ms)
+                self.beat_swing_long_next = True
+            # Schedule loop in case a frame is delayed
+            while self.beat_next_tick_time_ms is not None and now_ms >= self.beat_next_tick_time_ms:
+                if interval_ok:
+                    triggered = True
+                    self.beat_last_tick_time_ms = now_ms
+                # compute next interval with swing
+                base_interval = (60000.0 / bpm) / subdivision
+                s = max(0.0, min(50.0, swing_pct)) / 100.0
+                if s > 0.0:
+                    if getattr(self, 'beat_swing_long_next', True):
+                        interval = base_interval * (1.0 + s)
+                    else:
+                        interval = base_interval * (1.0 - s)
+                    self.beat_swing_long_next = not self.beat_swing_long_next
+                else:
+                    interval = base_interval
+                # Advance next tick
+                self.beat_next_tick_time_ms += interval
+
+        # Always log trigger decision once per event for visibility
+        if triggered:
+            try:
+                will_write_actions = False
+                if self.app:
+                    get = (self.app.app_settings.get if hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
+                    preview_write = bool(get('beat_preview_write_enabled', True))
+                    will_write_actions = bool(self.tracking_active or preview_write)
+                self.logger.info(
+                    f"BeatMarker TRIGGER source={source} z={z:.2f} thr={thr_sigma:.2f} "
+                    f"armed_before={(not getattr(self, 'beat_armed', False))} interval_ok={interval_ok} "
+                    f"will_write_actions={will_write_actions}"
+                )
+            except Exception:
+                pass
+
+        # Overlay visual aids
+        if getattr(self, 'show_stats', False) and source == "visual":
+            cv2.rectangle(processed_frame, (x1, y1), (x2, y2), RGBColors.YELLOW if self.beat_armed else RGBColors.ORANGE, 1)
+
+        # On beat: compute output position
+        # Allow writing during preview when enabled (default True)
+        can_write_now = False
+        if self.app:
+            get = (self.app.app_settings.get if hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
+            preview_write = bool(get('beat_preview_write_enabled', True))
+            can_write_now = bool(self.tracking_active or preview_write)
+
+        if triggered and self.app and can_write_now:
+            if waveform == "step":
+                # Read current toggle state (defaults to True on first use)
+                prev_toggle = getattr(self, 'beat_toggle_high', True)
+                pos = amp_max if prev_toggle else amp_min
+                # Debug log for toggle state and chosen amplitude
+                try:
+                    self.logger.debug(f"BeatMarker step: toggle_high={prev_toggle} -> pos={pos} (min={amp_min}, max={amp_max})")
+                    # Also log at INFO level for visibility in normal runs
+                    self.logger.info(f"BeatMarker step: toggle_high={prev_toggle} -> pos={pos} (min={amp_min}, max={amp_max})")
+                except Exception:
+                    pass
+                # Flip toggle for next beat
+                self.beat_toggle_high = not prev_toggle
+            else:
+                # Fallback to max for non-implemented waveforms
+                pos = amp_max
+
+            final_primary_pos = pos
+            final_secondary_pos = pos
+
+            # Remember last output for debugging/overlay
+            self.beat_last_output_pos = int(pos)
+
+            # Axis selection consistent with other trackers
+            current_tracking_axis_mode = getattr(self.app, 'tracking_axis_mode', 'both')
+            current_single_axis_output = getattr(self.app, 'single_axis_output_target', 'primary')
+            primary_to_write, secondary_to_write = None, None
+            if current_tracking_axis_mode == "both":
+                primary_to_write, secondary_to_write = final_primary_pos, final_secondary_pos
+            elif current_tracking_axis_mode == "vertical":
+                if current_single_axis_output == "primary":
+                    primary_to_write = final_primary_pos
+                else:
+                    secondary_to_write = final_primary_pos
+            elif current_tracking_axis_mode == "horizontal":
+                if current_single_axis_output == "primary":
+                    primary_to_write = final_secondary_pos
+                else:
+                    secondary_to_write = final_secondary_pos
+            elif current_tracking_axis_mode == "omni":
+                omni_pos = self._project_positions_to_omni(final_primary_pos, final_secondary_pos)
+                if current_single_axis_output == "primary":
+                    primary_to_write = omni_pos
+                else:
+                    secondary_to_write = omni_pos
+
+            # Delay compensation similar to other modes
+            automatic_smoothing_delay_frames = (self.flow_history_window_smooth - 1) / 2.0 if self.flow_history_window_smooth > 1 else 0.0
+            total_delay_frames = self.output_delay_frames + automatic_smoothing_delay_frames
+            base_delay_ms = (total_delay_frames / self.current_video_fps_for_delay) * 1000.0 if self.current_video_fps_for_delay > 0 else 0.0
+            primary_empty = (len(self.funscript.primary_actions) == 0)
+            secondary_empty = (len(self.funscript.secondary_actions) == 0)
+            effective_delay_ms = 0.0 if (primary_empty and primary_to_write is not None) or (secondary_empty and secondary_to_write is not None) else base_delay_ms
+            adjusted_frame_time_ms = frame_time_ms - effective_delay_ms
+
+            is_file_processing_context = frame_index is not None
+            self.funscript.add_action(
+                timestamp_ms=int(round(adjusted_frame_time_ms)),
+                primary_pos=primary_to_write,
+                secondary_pos=secondary_to_write,
+                is_from_live_tracker=(not is_file_processing_context)
+            )
+            action_log_list.append({
+                "at": int(round(adjusted_frame_time_ms)),
+                "pos": primary_to_write,
+                "secondary_pos": secondary_to_write,
+                "mode": current_tracking_axis_mode,
+                "target": current_single_axis_output if current_tracking_axis_mode != "both" else "N/A",
+                "raw_at": frame_time_ms,
+                "delay_applied_ms": effective_delay_ms,
+                "roi_main": None,
+                "amp": getattr(self, 'current_effective_amp_factor', 1.0)
+            })
+
+            # Immediately finalize and refresh UI so preview updates on each beat write
+            try:
+                if hasattr(self, 'app') and self.app and hasattr(self.app, 'funscript_processor'):
+                    if primary_to_write is not None:
+                        self.app.funscript_processor._finalize_action_and_update_ui(1, "Beat Marker: preview write (primary)")
+                    if secondary_to_write is not None:
+                        self.app.funscript_processor._finalize_action_and_update_ui(2, "Beat Marker: preview write (secondary)")
+                    self.logger.debug("BeatMarker: requested timeline UI refresh after action write.")
+            except Exception as e:
+                try:
+                    self.logger.warning(f"BeatMarker finalize/update failed: {e}")
+                except Exception:
+                    pass
+
+        # Stats text
+        # Stats text (B: brightness for visual, E: envelope for audio)
+        if source == "audio":
+            sig_label = f"E:{signal:.2f}"
+        else:
+            sig_label = f"B:{signal:.1f}"
+        self.stats_display = [
+            f"Beat FPS:{self.current_fps:.1f} T(ms):{frame_time_ms}",
+            f"{sig_label} z:{z:.2f} armed:{getattr(self, 'beat_armed', True)} trig:{triggered}",
+            f"Src:{source} WF:{waveform} Amp:[{amp_min},{amp_max}] Last:{getattr(self, 'beat_last_output_pos', 'n/a')} Tgl:{getattr(self, 'beat_toggle_high', True)}",
+            f"BPM:{bpm:.1f} Sub:{subdivision} Swing:{swing_pct:.1f}% Phase:{phase_deg:.1f}"
+        ]
+        if self.show_stats:
+            for i, stat_text in enumerate(self.stats_display):
+                cv2.putText(processed_frame, stat_text, (5, 15 + i * 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, RGBColors.TEAL, 1)
+
         return processed_frame, action_log_list if action_log_list else None
 
     def set_dot_initial_point(self, x_abs: int, y_abs: int, frame: Optional[np.ndarray] = None) -> None:
@@ -1923,6 +2336,25 @@ class ROITracker:
             self.dot_smoothed_xy = None
             self.dot_last_detected_xy = None
             self.logger.info("Dot Tracker started.")
+        elif self.tracking_mode == "BEAT_MARKER":
+            # Initialize Beat Marker state
+            from collections import deque
+            self.beat_last_tick_time_ms = None
+            self.beat_armed = True
+            self.beat_toggle_high = True  # for step waveform toggle
+            # Metronome scheduling state
+            self.beat_next_tick_time_ms = None
+            self.beat_swing_long_next = True  # alternate long/short when swing > 0
+            # brightness history for z-score; ~2s window at current FPS (fallback 30)
+            fps = self.app.processor.fps if self.app and self.app.processor and self.app.processor.fps > 0 else 30.0
+            history_len = max(15, int(2.0 * fps))
+            self.beat_brightness_history = deque(maxlen=history_len)
+            # Audio detection state: envelope history, novelty history, EMA baseline
+            self.beat_audio_env_history = deque(maxlen=int(2.0 * 200))  # ~2s at 200Hz envelope
+            self.beat_audio_novelty_history = deque(maxlen=200)
+            self.beat_audio_last_time_ms = None
+            self.beat_audio_ema = None
+            self.logger.info("Beat Marker mode started.")
 
     def stop_tracking(self):
         self.tracking_active = False

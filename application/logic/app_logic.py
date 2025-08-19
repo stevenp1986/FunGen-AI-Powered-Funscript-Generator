@@ -354,6 +354,10 @@ class ApplicationLogic:
                 tracker_mode_str = "OSCILLATION_DETECTOR"
             elif mode == TrackerMode.OSCILLATION_DETECTOR_LEGACY:
                 tracker_mode_str = "OSCILLATION_DETECTOR_LEGACY"
+            elif mode == TrackerMode.DOT_TRACKER:
+                tracker_mode_str = "DOT_TRACKER"
+            elif mode == TrackerMode.BEAT_MARKER:
+                tracker_mode_str = "BEAT_MARKER"
             else:
                 tracker_mode_str = "YOLO_ROI"
             self.tracker.set_tracking_mode(tracker_mode_str)
@@ -391,6 +395,60 @@ class ApplicationLogic:
         ultralytics_logger.setLevel(logging.ERROR)  # Only show errors from ultralytics
         
         self.logger.debug("Third-party logging configured for reduced startup noise")
+
+    def set_application_logging_level(self, level_name: str):
+        """Sets the application-wide logging level and propagates it to all handlers."""
+        numeric_level = getattr(logging, level_name.upper(), None)
+        if numeric_level is not None and hasattr(self, '_logger_instance') and hasattr(self._logger_instance, 'logger'):
+            logger_obj = self._logger_instance.logger
+            logger_obj.setLevel(numeric_level)
+            # Propagate to handlers (console, file, status, etc.)
+            try:
+                for h in list(logger_obj.handlers):
+                    h.setLevel(numeric_level)
+            except Exception:
+                pass
+
+            # Persist for current session and in settings
+            self.logging_level_setting = level_name
+            if hasattr(self, 'app_settings') and hasattr(self.app_settings, 'set'):
+                try:
+                    self.app_settings.set("logging_level", level_name.upper())
+                except Exception:
+                    pass
+
+            self.logger.info(f"Logging level changed to: {level_name}", extra={'status_message': True})
+        else:
+            self.logger.warning(f"Failed to set logging level or invalid level: {level_name}")
+
+    def _apply_loaded_settings(self):
+        """Applies core settings from AppSettings to runtime components."""
+        self.logger.debug("Applying loaded settings...")
+        try:
+            defaults = self.app_settings.get_default_settings()
+        except Exception:
+            defaults = {}
+
+        # Logging Level
+        new_logging_level = self.app_settings.get("logging_level", defaults.get("logging_level")) or "INFO"
+        if self.logging_level_setting != new_logging_level:
+            self.set_application_logging_level(new_logging_level)
+
+        # Inform sub-modules to update their settings
+        if hasattr(self, 'app_state_ui'):
+            self.app_state_ui.update_settings_from_app()
+        if hasattr(self, 'file_manager'):
+            self.file_manager.update_settings_from_app()
+        if hasattr(self, 'stage_processor'):
+            self.stage_processor.update_settings_from_app()
+        if hasattr(self, 'calibration'):
+            self.calibration.update_settings_from_app()
+        if hasattr(self, 'energy_saver'):
+            self.energy_saver.update_settings_from_app()
+        if hasattr(self, 'calibration'):
+            self.calibration.update_tracker_delay_params()
+        if hasattr(self, 'energy_saver'):
+            self.energy_saver.reset_activity_timer()
 
     def trigger_first_run_setup(self):
         """Initiates the first-run model download process in a background thread."""
@@ -1545,38 +1603,16 @@ class ApplicationLogic:
         # Pose model is now optional
         if not self.yolo_pose_model_path or not os.path.exists(self.yolo_pose_model_path):
             self.logger.warning(
-                f"Warning: YOLO Pose Model not found or path not set. Pose-dependent features will be disabled.",
-                extra={'status_message': True, 'duration': 8.0})
-        return True
-
-    def set_application_logging_level(self, level_name: str):
-        """Sets the application-wide logging level."""
-        numeric_level = getattr(logging, level_name.upper(), None)
-        if numeric_level is not None and hasattr(self, '_logger_instance') and hasattr(self._logger_instance, 'logger'):
-            self._logger_instance.logger.setLevel(numeric_level)
-            self.logging_level_setting = level_name
-            self.logger.info(f"Logging level changed to: {level_name}", extra={'status_message': True})
-        else:
-            self.logger.warning(f"Failed to set logging level or invalid level: {level_name}")
-
-    def _apply_loaded_settings(self):
-        """Applies all settings from AppSettings to their respective modules/attributes."""
-        self.logger.debug("Applying loaded settings...")
-        defaults = self.app_settings.get_default_settings()
-
-        self.discarded_tracking_classes = self.app_settings.get("discarded_tracking_classes", defaults.get("discarded_tracking_classes")) or []
-
-        # Logging Level
-        new_logging_level = self.app_settings.get("logging_level", defaults.get("logging_level")) or "INFO"
-        if self.logging_level_setting != new_logging_level:
-            self.set_application_logging_level(new_logging_level)
+                "Warning: YOLO Pose Model not found or path not set. Pose-dependent features will be disabled.",
+                extra={'status_message': True, 'duration': 8.0}
+            )
 
         # Hardware Acceleration
         default_hw_accel_in_apply = "auto"
         if "auto" not in self.available_ffmpeg_hwaccels:
             default_hw_accel_in_apply = "none" if "none" in self.available_ffmpeg_hwaccels else \
                 (self.available_ffmpeg_hwaccels[0] if self.available_ffmpeg_hwaccels else "none")
-        loaded_hw_method = self.app_settings.get("hardware_acceleration_method", defaults.get("hardware_acceleration_method")) or default_hw_accel_in_apply
+        loaded_hw_method = self.app_settings.get("hardware_acceleration_method", self.hardware_acceleration_method) or default_hw_accel_in_apply
         if loaded_hw_method not in self.available_ffmpeg_hwaccels:
             self.logger.warning(
                 f"Hardware acceleration method '{loaded_hw_method}' from settings is not currently available "
@@ -1586,8 +1622,8 @@ class ApplicationLogic:
             self.hardware_acceleration_method = loaded_hw_method
 
         # Models
-        self.yolo_detection_model_path_setting = self.app_settings.get("yolo_det_model_path", defaults.get("yolo_det_model_path"))
-        self.yolo_pose_model_path_setting = self.app_settings.get("yolo_pose_model_path", defaults.get("yolo_pose_model_path"))
+        self.yolo_detection_model_path_setting = self.app_settings.get("yolo_det_model_path")
+        self.yolo_pose_model_path_setting = self.app_settings.get("yolo_pose_model_path")
 
         # Update actual model paths used by tracker/processor if they changed
         if self.yolo_det_model_path != self.yolo_detection_model_path_setting:
@@ -1603,21 +1639,14 @@ class ApplicationLogic:
 
         # Tracker: apply omni-axis smoothing factor
         try:
-            omni_alpha = self.app_settings.get("omni_axis_alpha", defaults.get("omni_axis_alpha", 0.2))
+            omni_alpha = self.app_settings.get("omni_axis_alpha", 0.2)
             if self.tracker and hasattr(self.tracker, "omni_axis_alpha"):
                 self.tracker.omni_axis_alpha = omni_alpha
         except Exception:
             pass
 
-        # Inform sub-modules to update their settings
-        # TODO: Refactor this to use tuple unpacking
-        self.app_state_ui.update_settings_from_app()
-        self.file_manager.update_settings_from_app()
-        self.stage_processor.update_settings_from_app()
-        self.calibration.update_settings_from_app()
-        self.energy_saver.update_settings_from_app()
-        self.calibration.update_tracker_delay_params()
-        self.energy_saver.reset_activity_timer()
+        # Note: Do not update sub-modules here; they may not be initialized yet during __init__.
+        # Sub-module settings are applied later in _apply_loaded_settings().
 
     def save_app_settings(self):
         """Saves current application settings to file via AppSettings."""

@@ -132,6 +132,27 @@ class AppSettings:
             "dot_hue_tol": 12,                     # +/- hue tolerance around sampled hue (OpenCV 0-179)
             "dot_sat_tol": 80,                     # +/- sat tolerance around sampled S
             "dot_val_tol": 80,                     # +/- val tolerance around sampled V
+            
+            # --- Beat Marker Defaults ---
+            # Source can be 'visual' (ROI brightness) or 'metronome' (manual BPM)
+            "beat_source": "visual",
+            # Metronome/visual expected tempo
+            "beat_bpm": 120,
+            # Subdivision multiplier (1 = quarter notes, 2 = eighths, etc.)
+            "beat_subdivision": 1,
+            # Output amplitude range and waveform
+            "beat_amp_min": 10,
+            "beat_amp_max": 90,
+            "beat_waveform": "step",  # step | triangle | sine (future)
+            # Visual detection thresholds
+            "beat_threshold_sigma": 2.0,      # peaks when z-score crosses this from below
+            "beat_hysteresis_ratio": 0.6,     # drop back below this fraction of threshold to re-arm
+            "beat_min_interval_ms": 250,      # minimum time between beats
+            # Musical timing adjustments
+            "beat_swing_percent": 0.0,        # 0-50% swing (alternating long/short intervals)
+            "beat_phase_deg": 0.0,            # phase offset in degrees of one subdivision cycle
+            # ROI selection for visual source
+            "beat_use_user_roi": False,       # when true and a User ROI exists, use it for visual brightness
 
             # --- Settings for the 2D Oscillation Detector ---
             "oscillation_detector_grid_size": 20,

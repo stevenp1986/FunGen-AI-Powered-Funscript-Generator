@@ -178,6 +178,25 @@ class GPUTimelineIntegration:
         
         point_count = len(actions_list) if actions_list else 0
         
+        # Special-case: Beat Marker mode should never be gated by point thresholds
+        # We detect Beat Marker mode from the processor's tracker when available.
+        try:
+            processor = getattr(self.app, 'processor', None)
+            tracker = getattr(processor, 'tracker', None) if processor else None
+            tracking_mode = getattr(tracker, 'tracking_mode', None)
+            is_beat_marker_mode = (tracking_mode == 'BEAT_MARKER')
+        except Exception:
+            is_beat_marker_mode = False
+
+        if is_beat_marker_mode:
+            # Force GPU backend in Beat Marker mode to ensure immediate redraws with no thresholds.
+            if self.current_backend != RenderBackend.GPU_INSTANCED:
+                try:
+                    self.logger.info("BM: Forcing GPU backend; bypassing gpu_threshold_points gating")
+                except Exception:
+                    pass
+            return RenderBackend.GPU_INSTANCED
+
         # If GPU is not available or has failed too many times
         if (not self.gpu_renderer or 
             not self.gpu_renderer.gl_initialized or

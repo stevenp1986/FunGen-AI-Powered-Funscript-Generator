@@ -113,13 +113,12 @@ class AppEventHandlers:
         self.app.energy_saver.reset_activity_timer()
 
     def handle_start_live_tracker_click(self):
-        if not self.app._check_model_paths():
-            return
+        # Ensure basic runtime preconditions
         if not self.app.processor or not self.app.file_manager.video_path:
             self.logger.info("No video loaded for live tracking.", extra={'status_message': True})
             return
         if not self.app.tracker:
-            self.logger.error("Tracker not initialized for live tracking.")
+            self.logger.error("Tracker not initialized for live tracking.", extra={'status_message': True})
             return
 
         selected_mode_from_ui = self.app.app_state_ui.selected_tracker_mode
@@ -136,10 +135,25 @@ class AppEventHandlers:
             self.app.tracker.set_tracking_mode("YOLO_ROI")
         elif selected_mode_from_ui == TrackerMode.DOT_TRACKER:
             self.app.tracker.set_tracking_mode("DOT_TRACKER")
+        elif selected_mode_from_ui == TrackerMode.BEAT_MARKER:
+            self.app.tracker.set_tracking_mode("BEAT_MARKER")
 
         current_tracker_mode = self.app.tracker.tracking_mode
 
-        if current_tracker_mode == "USER_FIXED_ROI":
+        # Log selected UI mode and resolved tracker mode to aid debugging
+        try:
+            self.logger.info(f"Live start requested: ui_mode={selected_mode_from_ui} -> tracker_mode={current_tracker_mode}", extra={'status_message': True})
+        except Exception:
+            pass
+
+        # Only require model checks for YOLO-based modes
+        if current_tracker_mode == "YOLO_ROI":
+            self.logger.info("Live start: YOLO mode selected, performing model checks...", extra={'status_message': True})
+            if not self.app._check_model_paths():
+                self.logger.warning("Model check failed. Cannot start YOLO_ROI live tracking.", extra={'status_message': True})
+                return
+            self.logger.info("Starting Live Tracker (YOLO_ROI mode - if applicable).")
+        elif current_tracker_mode == "USER_FIXED_ROI":
             # Check for a global ROI OR a chapter-specific ROI at the current frame
             has_global_roi = bool(
                 self.app.tracker.user_roi_fixed and (
@@ -164,14 +178,15 @@ class AppEventHandlers:
                self.app.tracker.user_roi_tracked_point_relative:
                 self.app.tracker.user_roi_initial_point_relative = self.app.tracker.user_roi_tracked_point_relative
             self.logger.info("Starting User Defined ROI tracking.")
-        elif current_tracker_mode == "YOLO_ROI":
-            self.logger.info("Starting Live Tracker (YOLO_ROI mode - if applicable).")
         elif current_tracker_mode == "OSCILLATION_DETECTOR":
             self.logger.info("Starting Live Tracker (2D Oscillation Detector mode).")
         elif current_tracker_mode == "OSCILLATION_DETECTOR_LEGACY":
             self.logger.info("Starting Live Tracker (2D Oscillation Detector Legacy mode).")
         elif current_tracker_mode == "DOT_TRACKER":
             self.logger.info("Starting Live Tracker (Dot Tracker mode).")
+        elif current_tracker_mode == "BEAT_MARKER":
+            # Explicitly state we are skipping model checks for this non-YOLO mode
+            self.logger.info("Starting Live Tracker (Beat Marker mode). Skipping model checks.", extra={'status_message': True})
         
         else:
             self.logger.error(f"Unknown tracker mode for live start: {current_tracker_mode}");

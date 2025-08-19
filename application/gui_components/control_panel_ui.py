@@ -312,6 +312,7 @@ class ControlPanelUI:
             self.TrackerMode.OSCILLATION_DETECTOR,
             self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
             getattr(self.TrackerMode, 'DOT_TRACKER', None),
+            getattr(self.TrackerMode, 'BEAT_MARKER', None),
         )
         is_playback_active = processor and processor.is_processing and not processor.enable_tracker_processing
 
@@ -358,6 +359,7 @@ class ControlPanelUI:
             tracker_mode.LIVE_YOLO_ROI,
             tracker_mode.LIVE_USER_ROI,
             getattr(tracker_mode, 'DOT_TRACKER', None),
+            getattr(tracker_mode, 'BEAT_MARKER', None),
             tracker_mode.OFFLINE_2_STAGE,
             tracker_mode.OFFLINE_3_STAGE,
             tracker_mode.OFFLINE_3_STAGE_MIXED,
@@ -433,6 +435,8 @@ class ControlPanelUI:
                         tr.set_tracking_mode("OSCILLATION_DETECTOR_LEGACY")
                     elif getattr(tracker_mode, 'DOT_TRACKER', None) and new_mode == tracker_mode.DOT_TRACKER:
                         tr.set_tracking_mode("DOT_TRACKER")
+                    elif getattr(tracker_mode, 'BEAT_MARKER', None) and new_mode == tracker_mode.BEAT_MARKER:
+                        tr.set_tracking_mode("BEAT_MARKER")
                     else:
                         tr.set_tracking_mode("YOLO_ROI")
 
@@ -596,8 +600,133 @@ class ControlPanelUI:
             self.TrackerMode.OFFLINE_3_STAGE,
             self.TrackerMode.OFFLINE_3_STAGE_MIXED,
         }
+        # Beat Marker settings
+        if getattr(self.TrackerMode, 'BEAT_MARKER', None) and tmode == self.TrackerMode.BEAT_MARKER:
+            if imgui.collapsing_header("Beat Marker Settings##ConfigBeatMarker", flags=imgui.TREE_NODE_DEFAULT_OPEN)[0]:
+                self._render_beat_marker_settings()
+
         if tmode not in with_config:
             imgui.text_disabled("No configuration available for this mode.")
+
+    def _render_beat_marker_settings(self):
+        app = self.app
+        settings = app.app_settings
+        style = imgui.get_style()
+
+        # Source
+        sources = ["visual", "audio", "metronome"]
+        cur_source = settings.get("beat_source", "visual")
+        try:
+            cur_idx = sources.index(cur_source)
+        except ValueError:
+            cur_idx = 0
+        imgui.text("Beat Source")
+        imgui.push_item_width(200)
+        changed, new_idx = imgui.combo("##BeatSource", cur_idx, sources)
+        imgui.pop_item_width()
+        if changed and 0 <= new_idx < len(sources):
+            settings.set("beat_source", sources[new_idx])
+            cur_source = sources[new_idx]
+        # clarify that audio is envelope-based and BPM is for metronome
+        _tooltip_if_hovered("Choose visual (brightness-based), audio (envelope-based), or metronome (timer-based) beat source.")
+
+        is_metronome = (cur_source == "metronome")
+        is_visual = (cur_source == "visual")
+
+        # Tempo and subdivision
+        imgui.text("Tempo & Subdivision (Metronome)")
+        imgui.push_item_width(120)
+        bpm = float(settings.get("beat_bpm", 120))
+        with _DisabledScope(not is_metronome):
+            ch_bpm, new_bpm = imgui.input_float("BPM##BeatBPM", bpm, step=1.0, step_fast=5.0, format="%.1f")
+        imgui.same_line()
+        sub_list = ["1", "2", "3", "4"]
+        sub_cur = str(max(1, int(settings.get("beat_subdivision", 1))))
+        try:
+            sub_idx = sub_list.index(sub_cur)
+        except ValueError:
+            sub_idx = 0
+        # Disable BPM/subdivision unless metronome is selected
+        with _DisabledScope(not is_metronome):
+            ch_sub, new_sub_idx = imgui.combo("Subdivision##BeatSubdivision", sub_idx, sub_list)
+        imgui.pop_item_width()
+        if is_metronome and ch_bpm:
+            settings.set("beat_bpm", max(1.0, float(new_bpm)))
+        if is_metronome and ch_sub:
+            settings.set("beat_subdivision", int(sub_list[new_sub_idx]))
+        _tooltip_if_hovered("BPM/subdivision used for metronome source only.")
+
+        # Amplitude range and waveform
+        imgui.text("Output Range & Waveform")
+        amp_min = int(settings.get("beat_amp_min", 10))
+        amp_max = int(settings.get("beat_amp_max", 90))
+        imgui.push_item_width(200)
+        ch_min, new_min = imgui.slider_int("Min##BeatAmpMin", amp_min, 0, 100)
+        ch_max, new_max = imgui.slider_int("Max##BeatAmpMax", amp_max, 0, 100)
+        imgui.pop_item_width()
+        if ch_min or ch_max:
+            if ch_min:
+                amp_min = int(new_min)
+            if ch_max:
+                amp_max = int(new_max)
+            if amp_min > amp_max:
+                amp_min, amp_max = amp_max, amp_min
+            settings.set_batch(beat_amp_min=amp_min, beat_amp_max=amp_max)
+        waveforms = ["step", "triangle", "sine"]
+        cur_wave = settings.get("beat_waveform", "step")
+        try:
+            wave_idx = waveforms.index(cur_wave)
+        except ValueError:
+            wave_idx = 0
+        imgui.push_item_width(200)
+        ch_w, new_w_idx = imgui.combo("Waveform##BeatWaveform", wave_idx, waveforms)
+        imgui.pop_item_width()
+        if ch_w:
+            settings.set("beat_waveform", waveforms[new_w_idx])
+        _tooltip_if_hovered("Waveform of output on each beat. Currently, only 'step' is implemented.")
+
+        # Detection thresholds (apply to both audio and visual). ROI option only for visual.
+        imgui.text("Detection Thresholds (Audio/Visual)")
+        if is_visual:
+            use_user_roi = bool(settings.get("beat_use_user_roi", False))
+            ch_roi, nv_roi = imgui.checkbox("Use User ROI (Visual Only)##BeatUseUserROI", use_user_roi)
+            if ch_roi and nv_roi != use_user_roi:
+                settings.set("beat_use_user_roi", nv_roi)
+            _tooltip_if_hovered("When enabled and an ROI is set (Run Control → Set ROI), the visual detector measures brightness inside that ROI.")
+
+        thr_sigma = float(settings.get("beat_threshold_sigma", 2.0))
+        h_ratio = float(settings.get("beat_hysteresis_ratio", 0.6))
+        min_int = float(settings.get("beat_min_interval_ms", 250))
+        imgui.push_item_width(220)
+        ch_t, new_thr = imgui.slider_float("Threshold Z-score##BeatThr", thr_sigma, 0.5, 5.0, format="%.2f")
+        ch_h, new_hr = imgui.slider_float("Hysteresis Ratio##BeatHyst", h_ratio, 0.1, 0.95, format="%.2f")
+        ch_mi, new_mi = imgui.input_float("Min Interval (ms)##BeatMinInterval", min_int, step=10.0, step_fast=50.0, format="%.0f")
+        imgui.pop_item_width()
+        if ch_t:
+            settings.set("beat_threshold_sigma", float(new_thr))
+        if ch_h:
+            settings.set("beat_hysteresis_ratio", float(new_hr))
+        if ch_mi:
+            settings.set("beat_min_interval_ms", max(0.0, float(new_mi)))
+        _tooltip_if_hovered("Z-score threshold and hysteresis; minimum spacing between beats. Applies to visual and audio detection.")
+
+        # Timing adjustments (Metronome only)
+        imgui.text("Metronome Timing Adjustments")
+        swing = float(settings.get("beat_swing_percent", 0.0))
+        phase = float(settings.get("beat_phase_deg", 0.0))
+        imgui.push_item_width(220)
+        with _DisabledScope(not is_metronome):
+            ch_sw, new_sw = imgui.slider_float("Swing (% )##BeatSwing", swing, 0.0, 50.0, format="%.1f")
+            ch_ph, new_ph = imgui.slider_float("Phase (deg)##BeatPhase", phase, -180.0, 180.0, format="%.1f")
+        imgui.pop_item_width()
+        if is_metronome and ch_sw:
+            settings.set("beat_swing_percent", float(new_sw))
+        if is_metronome and ch_ph:
+            settings.set("beat_phase_deg", float(new_ph))
+        _tooltip_if_hovered("Swing and phase used for metronome source only.")
+
+        imgui.spacing()
+        imgui.text_disabled("Note: BPM/Swing/Phase are metronome-only. Visual supports User ROI. Audio uses the extracted envelope.")
 
     def _render_settings_tab(self):
         app = self.app
@@ -1051,7 +1180,7 @@ class ControlPanelUI:
             self._render_stage_progress_ui(stage_proc)
             return
 
-        if mode in (self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY, getattr(self.TrackerMode, 'DOT_TRACKER', None)):
+        if mode in (self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY, getattr(self.TrackerMode, 'DOT_TRACKER', None), getattr(self.TrackerMode, 'BEAT_MARKER', None)):
             tr = app.tracker
             imgui.text(">> Tracker Status")
             if tr:
@@ -1071,14 +1200,26 @@ class ControlPanelUI:
                     # Show whether a dot column/point was selected
                     has_dot = getattr(tr, "dot_initial_point", None) is not None or getattr(tr, "dot_selected_column", None) is not None
                     roi_status = "Dot Selected" if has_dot else "Waiting for dot pick"
-            imgui.text(" - ROI Status: %s" % roi_status)
+                elif getattr(self.TrackerMode, 'BEAT_MARKER', None) and mode == self.TrackerMode.BEAT_MARKER:
+                    # Beat Marker: show ROI status for visual source and provide ROI controls
+                    settings = app.app_settings
+                    source = settings.get("beat_source", "visual")
+                    use_user_roi = bool(settings.get("beat_use_user_roi", False))
+                    has_roi = bool(getattr(tr, "user_roi_fixed", None))
+                    if source == "visual":
+                        if use_user_roi:
+                            roi_status = "ROI: %s" % ("Set" if has_roi else "Not Set")
+                        else:
+                            roi_status = "Using center patch (ROI disabled)"
+                    else:
+                        roi_status = "Metronome source (ROI not used)"
 
-            if mode == self.TrackerMode.LIVE_USER_ROI:
-                self._render_user_roi_controls_for_run_tab()
-            elif getattr(self.TrackerMode, 'DOT_TRACKER', None) and mode == self.TrackerMode.DOT_TRACKER:
-                self._render_dot_tracker_controls_for_run_tab()
-            return
+                    # Display status line
+                    imgui.text(roi_status)
 
+                    # For visual source, reuse the User ROI controls (Set/Clear)
+                    if source == "visual":
+                        self._render_user_roi_controls_for_run_tab()
     def _render_dot_tracker_controls_for_run_tab(self):
         app = self.app
         sp = app.stage_processor
@@ -1335,6 +1476,7 @@ class ControlPanelUI:
                 self.TrackerMode.OSCILLATION_DETECTOR,
                 self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
                 getattr(self.TrackerMode, 'DOT_TRACKER', None),
+                getattr(self.TrackerMode, 'BEAT_MARKER', None),
             ]:
                 imgui.new_line()
                 start_text = "Start Live Tracking (Range)" if fs_proc.scripting_range_active else "Start Live Tracking"
@@ -1391,6 +1533,7 @@ class ControlPanelUI:
             self.TrackerMode.LIVE_USER_ROI,
             self.TrackerMode.OSCILLATION_DETECTOR,
             self.TrackerMode.OSCILLATION_DETECTOR_LEGACY,
+            getattr(self.TrackerMode, 'BEAT_MARKER', None),
             getattr(self.TrackerMode, 'DOT_TRACKER', None),
         ]:
             imgui.text_ansi_colored("It can take up to 35 seconds to see output on the timelines.\nThis is a known feature.", 0.25, 0.88, 0.82)
@@ -1398,7 +1541,7 @@ class ControlPanelUI:
     def _render_stage_progress_ui(self, stage_proc):
         is_analysis_running = stage_proc.full_analysis_active
         selected_mode = self.app.app_state_ui.selected_tracker_mode
-
+        # Progress color settings
         active_progress_color = self.ControlPanelColors.ACTIVE_PROGRESS # Vibrant blue for active
         completed_progress_color = self.ControlPanelColors.COMPLETED_PROGRESS # Vibrant green for completed
 
