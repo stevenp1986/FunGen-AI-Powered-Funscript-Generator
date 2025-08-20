@@ -91,7 +91,7 @@ class TrackerMode(Enum):
     DOT_TRACKER = "Live - Dot Tracker (Manual point)"                            # 7
     BEAT_MARKER = "Live - Beat Marker (Visual/Audio)"                            # 8
 
-DEFAULT_TRACKER_MODE = 0
+DEFAULT_TRACKER_MODE = 8
 
 ####################################################################################################
 # AI & MODELS

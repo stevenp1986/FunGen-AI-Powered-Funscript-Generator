@@ -14,6 +14,13 @@ from collections import OrderedDict
 
 from config import constants
 
+# Optional audio backend (sounddevice + PyAV)
+try:
+    from audio.sd_pyav_backend import SoundDevicePyAVAudioBackend  # type: ignore
+    _SD_PYAV_BACKEND_AVAILABLE = True
+except Exception:
+    SoundDevicePyAVAudioBackend = None  # type: ignore
+    _SD_PYAV_BACKEND_AVAILABLE = False
 
 try:
     from scipy.io import wavfile
@@ -118,6 +125,14 @@ class VideoProcessor:
         # Diagnostics/throttling for audio envelope logging
         self._audio_env_diag_once: bool = False
         self._audio_env_oob_log_count: int = 0
+
+        # Audio output backend (optional)
+        self._audio_backend = None
+        try:
+            if _SD_PYAV_BACKEND_AVAILABLE and SoundDevicePyAVAudioBackend is not None:
+                self._audio_backend = SoundDevicePyAVAudioBackend(self.logger)
+        except Exception:
+            self._audio_backend = None
         # Effective envelope rate (derived from integer window size)
         self._audio_env_effective_rate_hz: float = float(self._audio_env_rate_hz)
 
@@ -140,6 +155,7 @@ class VideoProcessor:
         self._audio_last_start_media_time: Optional[float] = None
         self._audio_last_start_wallclock: Optional[float] = None
         self._audio_last_resync_wallclock: float = 0.0
+        self._audio_sync_comp_ms_default: int = 0
 
     def _clear_cache(self):
         with self.frame_cache_lock:
@@ -308,9 +324,9 @@ class VideoProcessor:
                 self._cleanup_invalid_preprocessed_file(preprocessed_path)
 
         if self._active_video_source_path == preprocessed_path:
-            self.logger.info(f"VideoProcessor will use preprocessed video as its active source.")
+            self.logger.warning(f"VideoProcessor will use preprocessed video as its active source.")
         else:
-            self.logger.info(f"VideoProcessor will use original video as its active source.")
+            self.logger.warning(f"VideoProcessor will use original video as its active source.")
 
         self._update_video_parameters()
 
@@ -1096,6 +1112,8 @@ class VideoProcessor:
         start_time_seconds = start_frame_abs_idx / self.video_info['fps']
         # Remember base seek time to offset showinfo pts_time (which often starts near 0 due to genpts)
         self._current_stream_seek_time_seconds = float(max(0.0, start_time_seconds))
+        # Reset first-frame pts marker for new stream
+        self._first_frame_pts_time = None
         self.current_stream_start_frame_abs = start_frame_abs_idx
         self.frames_read_from_current_stream = 0
         # Mark that we should resync audio when the first frame is actually received
@@ -1398,85 +1416,69 @@ class VideoProcessor:
             if not self.video_path or not self.video_info or not self.video_info.get("has_audio"):
                 return
             get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
-            if not bool(get('audio_playback_enabled', self._audio_play_enabled_default)):
+            if not bool(get('audio_playback_enabled', True)):
                 self._stop_audio_playback()
                 return
 
-            vol_setting = int(get('audio_volume', self._audio_volume_default))
+            # Use SoundDevice+PyAV backend if available
+            backend = getattr(self, '_audio_backend', None)
+            if backend is None or not getattr(backend, 'available', False):
+                self.logger.info("Audio backend unavailable; skipping playback.")
+                self._audio_play_process = None
+                self._audio_last_start_media_time = None
+                self._audio_last_start_wallclock = None
+                return
+
+            # Volume
+            vol_setting = int(get('audio_volume', 100) or 100)
             vol_setting = max(0, min(100, vol_setting))
-            vol_linear = vol_setting / 100.0
-            # Honor explicit user setting only; default to 0ms
+            backend.set_volume(vol_setting / 100.0)
+
+            # Start time with optional compensation/offset
             offset_ms = int(get('audio_playback_offset_ms', 0) or 0)
-            effective_start_time = max(0.0, float(start_time_seconds) + (float(offset_ms) / 1000.0))
+            compensation_ms = int(get('audio_sync_comp_ms', 0) or 0)
+            effective_start_time = max(0.0, float(start_time_seconds) + (float(offset_ms) / 1000.0) + (float(compensation_ms) / 1000.0))
 
-            # Stop any prior audio playback
-            self._stop_audio_playback()
+            # Choose audio source (prefer active source with audio)
+            def choose_audio_source() -> str:
+                primary = getattr(self, '_active_video_source_path', None)
+                if primary and os.path.exists(primary) and self._path_has_audio_stream(primary):
+                    return primary
+                return self.video_path
 
-            # Prefer active source if it exists AND has audio; otherwise fallback to original
-            primary_audio_source = (
-                self._active_video_source_path
-                if (
-                    self._active_video_source_path
-                    and os.path.exists(self._active_video_source_path)
-                    and self._path_has_audio_stream(self._active_video_source_path)
-                )
-                else None
-            )
-            fallback_audio_source = self.video_path
-            chosen_source = primary_audio_source or fallback_audio_source
-            src_label = "ACTIVE source" if chosen_source == primary_audio_source else "ORIGINAL file"
-            self.logger.info(f"Audio source (preferred): {src_label} -> {os.path.basename(chosen_source)}")
+            chosen_source = choose_audio_source()
+            self.logger.info(f"Audio backend starting from {os.path.basename(chosen_source)} at t={effective_start_time:.3f}s, volume={vol_setting}%")
 
-            def _run_ffplay(path: str):
-                # Use accurate seek for audio: place -ss AFTER -i for precise start
-                cmd = [
-                    'ffplay', '-nodisp', '-autoexit', '-loglevel', 'error',
-                    '-i', path, '-ss', f"{effective_start_time:.3f}", '-vn', '-sn',
-                    '-af', f"volume={vol_linear:.3f}"
-                ]
-                self.logger.info(f"Starting ffplay: {' '.join(shlex.quote(str(x)) for x in cmd)}")
-                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creation_flags)
+            # Restart backend from desired position
+            try:
+                backend.start(chosen_source, effective_start_time)
+            except Exception as e:
+                self.logger.warning(f"Audio backend failed to start: {e}")
+                self._audio_play_process = None
+                return
 
-            # Launch preferred; fallback if it immediately exits
-            self._audio_play_process = _run_ffplay(chosen_source)
-            time.sleep(0.2)
-            if self._audio_play_process.poll() is not None and chosen_source != fallback_audio_source:
-                self.logger.warning("Preferred audio source failed to start; falling back to ORIGINAL file")
-                self._audio_play_process = _run_ffplay(fallback_audio_source)
-
-            # Record audio start timing to allow drift monitoring
+            # Record audio start timing for drift monitoring, and set sentinel to indicate playback active
             self._audio_last_start_media_time = float(effective_start_time)
             self._audio_last_start_wallclock = time.monotonic()
-            self.logger.info(
-                f"Audio playback started at t={effective_start_time:.3f}s (base={start_time_seconds:.3f}s, offset={offset_ms}ms), volume={vol_setting}%")
-        except FileNotFoundError:
-            self.logger.warning("ffplay not found on system PATH. Audio playback disabled.")
+            # Maintain compatibility with checks that test _audio_play_process is not None
+            self._audio_play_process = object()
+        except Exception:
+            # Be resilient: never crash video on audio start
             self._audio_play_process = None
-        except Exception as e:
-            self.logger.warning(f"Failed to start ffplay: {e}")
-            self._audio_play_process = None
+            self._audio_last_start_media_time = None
+            self._audio_last_start_wallclock = None
 
     def _stop_audio_playback(self):
         """Stop ffplay audio playback process if running."""
-        proc = getattr(self, '_audio_play_process', None)
-        if not proc:
-            self._audio_play_process = None
-            return
+        # Stop new backend if present
         try:
-            if proc.poll() is None:
-                self.logger.debug("Stopping ffplay audio playback.")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            else:
-                self.logger.debug("ffplay process already exited.")
+            backend = getattr(self, '_audio_backend', None)
+            if backend is not None:
+                backend.stop()
         except Exception:
             pass
-        finally:
-            self._audio_play_process = None
+        # Clear legacy/sentinel state
+        self._audio_play_process = None
 
     def seek_video(self, frame_index: int) -> None:
         """
@@ -1569,7 +1571,7 @@ class VideoProcessor:
         bytes_per_frame = self.frame_size_bytes
         fps_val = float(self.video_info.get('fps', 30.0)) if self.video_info else 30.0
 
-        # Real-time pacing state
+        # Real-time pacing state (video pacing only)
         play_base_time: Optional[float] = None
         play_base_frame: Optional[int] = None
         prev_paused: bool = False
@@ -1581,6 +1583,7 @@ class VideoProcessor:
                     prev_paused = True
                     time.sleep(0.01)
                     continue
+
 
                 # If FFmpeg terminated, break
                 if proc.poll() is not None and proc.stdout.peek() if hasattr(proc.stdout, 'peek') else False:
@@ -1626,204 +1629,54 @@ class VideoProcessor:
                     play_base_frame = abs_idx
                     prev_paused = False
 
+                # Pace to real-time so video runs smoothly
+                try:
+                    expected_elapsed = (abs_idx - (play_base_frame or abs_idx)) / (fps_val if fps_val > 0 else 30.0)
+                    target_time = (play_base_time or now) + expected_elapsed
+                    delay = target_time - now
+                    if delay > 0:
+                        # Sleep the full remaining delay; do not cap to avoid running too fast
+                        time.sleep(delay)
+                except Exception:
+                    pass
+
                 # Start audio playback on first decoded frame after seek
                 if getattr(self, '_pending_audio_resync', False):
                     try:
-                        # Use captured first-frame PTS relative to current stream, offset by base seek time.
-                        if self._first_frame_pts_time is not None:
-                            start_time = float(self._current_stream_seek_time_seconds) + float(self._first_frame_pts_time)
-                        else:
-                            # Fallback to index-based time if PTS was not captured
-                            start_time = max(0.0, abs_idx / (fps_val if fps_val > 0 else 30.0))
+                        # Always align audio start to the precise stream seek time
+                        base_seek = getattr(self, '_current_stream_seek_time_seconds', 0.0) or 0.0
+                        start_time = max(0.0, float(base_seek))
+                        self.logger.info(
+                            f"A/V sync: starting audio at seek base={base_seek:.3f}s (abs_idx={abs_idx}, fps={fps_val})")
                         self._maybe_start_audio_playback(start_time)
                     except Exception as e:
                         self.logger.warning(f"Audio resync start failed: {e}")
                     finally:
                         self._pending_audio_resync = False
+                        self._first_frame_pts_time = None
 
                 # End-frame limit check
-                if self.processing_end_frame_limit != -1 and abs_idx >= self.processing_end_frame_limit:
-                    self.logger.info(f"Reached processing end frame {self.processing_end_frame_limit}. Stopping loop.")
+                if getattr(self, 'processing_end_frame_limit', -1) != -1 and abs_idx >= self.processing_end_frame_limit:
+                    self.logger.info(f"End of requested frame range reached at {abs_idx}.")
                     break
 
-                # Real-time pacing by target FPS
-                try:
-                    if fps_val > 0 and play_base_time is not None and play_base_frame is not None:
-                        expected_elapsed = (abs_idx - play_base_frame + 1) / fps_val
-                        actual_elapsed = now - play_base_time
-                        lag = expected_elapsed - actual_elapsed
-                        if lag > 0:
-                            time.sleep(min(0.05, lag))
-                except Exception:
-                    pass
+                # No drift monitoring/resync: audio is started once per seek and left running
 
+            # end while
         except Exception as e:
-            self.logger.error(f"Error in _processing_loop: {e}", exc_info=True)
+            self.logger.error(f"_processing_loop encountered an error: {e}", exc_info=True)
         finally:
-            # Cleanup
             try:
-                if self._stderr_reader_stop is not None:
-                    self._stderr_reader_stop.set()
-                if self._stderr_reader_thread and self._stderr_reader_thread.is_alive():
-                    self._stderr_reader_thread.join(timeout=1.0)
+                self._terminate_ffmpeg_processes()
             except Exception:
                 pass
-
-            self._terminate_ffmpeg_processes()
             self.is_processing = False
             self.pause_event.clear()
             self.stop_event.clear()
             self.logger.debug("Processing loop exited and cleaned up.")
 
-    def _start_ffmpeg_for_segment_streaming(self, start_frame_abs_idx: int, num_frames_to_stream_hint: Optional[int] = None) -> bool:
-        self._terminate_ffmpeg_processes()
-
-        if not self.video_path or not self.video_info or self.video_info.get('fps', 0) <= 0:
-            self.logger.warning("Cannot start FFmpeg for segment: no video/invalid FPS.")
-            return False
-
-        start_time_seconds = start_frame_abs_idx / self.video_info['fps']
-        # Remember base seek time to offset showinfo pts_time
-        self._current_stream_seek_time_seconds = float(max(0.0, start_time_seconds))
-        # Use -loglevel info so showinfo prints PTS to stderr
-        common_ffmpeg_prefix = ['ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'info']
-
-        if self._is_10bit_cuda_pipe_needed():
-            self.logger.info("Using 2-pipe FFmpeg command for 10-bit CUDA segment streaming.")
-            video_height_for_crop = self.video_info.get('height', 0)
-            if video_height_for_crop <= 0:
-                self.logger.error("Cannot construct 10-bit CUDA pipe 1 for segment: video height is unknown.")
-                return False
-
-            pipe1_vf = f"crop={int(video_height_for_crop)}:{int(video_height_for_crop)}:0:0,scale_cuda=1000:1000"
-            cmd1 = common_ffmpeg_prefix[:]
-            cmd1.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
-            cmd1.extend(['-i', self._active_video_source_path])
-            if start_time_seconds > 0.001: cmd1.extend(['-ss', str(start_time_seconds)])  # accurate seek
-            cmd1.extend(['-an', '-sn', '-vf', pipe1_vf])
-            if num_frames_to_stream_hint and num_frames_to_stream_hint > 0:
-                cmd1.extend(['-frames:v', str(num_frames_to_stream_hint)])
-            cmd1.extend(['-c:v', 'hevc_nvenc', '-preset', 'fast', '-qp', '0', '-f', 'matroska', 'pipe:1'])
-
-            cmd2 = common_ffmpeg_prefix[:]
-            cmd2.extend(['-hwaccel', 'cuda', '-i', 'pipe:0', '-an', '-sn'])
-            effective_vf_pipe2 = self.ffmpeg_filter_string or f"scale={self.yolo_input_size}:{self.yolo_input_size}"
-            # Append showinfo to capture pts_time on stderr for sync
-            cmd2.extend(['-vf', f"{effective_vf_pipe2},showinfo"]) 
-            if num_frames_to_stream_hint and num_frames_to_stream_hint > 0:
-                cmd2.extend(['-frames:v', str(num_frames_to_stream_hint)])
-            cmd2.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
-
-            self.logger.info(f"Segment Pipe 1 CMD: {' '.join(shlex.quote(str(x)) for x in cmd1)}")
-            self.logger.info(f"Segment Pipe 2 CMD: {' '.join(shlex.quote(str(x)) for x in cmd2)}")
-            try:
-                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                self.ffmpeg_pipe1_process = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creation_flags)
-                if self.ffmpeg_pipe1_process.stdout is None:
-                    raise IOError("Segment Pipe 1 stdout is None.")
-                self.ffmpeg_process = subprocess.Popen(cmd2, stdin=self.ffmpeg_pipe1_process.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_size_bytes * 20, creationflags=creation_flags)
-                self.ffmpeg_pipe1_process.stdout.close()
-                # Start stderr reader to capture first pts_time from showinfo
-                self._first_frame_pts_time = None
-                self._stderr_reader_stop = threading.Event()
-                def _stderr_reader(proc, setter, stop_evt):
-                    # Drain stderr continuously to avoid FFmpeg blocking if pipe fills.
-                    # Capture first pts_time via setter, then keep discarding lines.
-                    try:
-                        import re
-                        pat = re.compile(r"pts_time:([0-9]+\.[0-9]+)")
-                        got_first = False
-                        while not stop_evt.is_set():
-                            line = proc.stderr.readline()
-                            if not line:
-                                break
-                            if not got_first:
-                                try:
-                                    s = line.decode('utf-8', errors='ignore')
-                                except Exception:
-                                    continue
-                                m = pat.search(s)
-                                if m:
-                                    try:
-                                        val = float(m.group(1))
-                                        setter(val)
-                                        got_first = True
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-                self._stderr_reader_thread = threading.Thread(target=_stderr_reader, args=(self.ffmpeg_process, lambda v: setattr(self, '_first_frame_pts_time', v), self._stderr_reader_stop), name="FFmpegSegStderrReader")
-                self._stderr_reader_thread.daemon = True
-                self._stderr_reader_thread.start()
-                return True
-            except Exception as e:
-                self.logger.error(f"Failed to start 2-pipe FFmpeg for segment: {e}", exc_info=True)
-                self._terminate_ffmpeg_processes()
-                return False
-        else:
-            # Standard single FFmpeg process for 8-bit or non-CUDA accelerated video
-            hwaccel_cmd_list = self._get_ffmpeg_hwaccel_args()
-            ffmpeg_input_options = hwaccel_cmd_list[:]
-            ffmpeg_cmd = common_ffmpeg_prefix + ffmpeg_input_options + ['-i', self._active_video_source_path]
-            if start_time_seconds > 0.001: ffmpeg_cmd.extend(['-ss', str(start_time_seconds)])  # accurate seek
-            ffmpeg_cmd.extend(['-an', '-sn'])
-            effective_vf = self.ffmpeg_filter_string or f"scale={self.yolo_input_size}:{self.yolo_input_size}"
-            ffmpeg_cmd.extend(['-vf', f"{effective_vf},showinfo"]) 
-
-            if num_frames_to_stream_hint and num_frames_to_stream_hint > 0:
-                ffmpeg_cmd.extend(['-frames:v', str(num_frames_to_stream_hint)])
-
-            ffmpeg_cmd.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
-            self.logger.info(f"Segment CMD (single pipe): {' '.join(shlex.quote(str(x)) for x in ffmpeg_cmd)}")
-            try:
-                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                self.ffmpeg_process = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=self.frame_size_bytes * 20,
-                    creationflags=creation_flags,
-                )
-                # Start stderr reader to capture first pts_time from showinfo (single-pipe path)
-                self._first_frame_pts_time = None
-                self._stderr_reader_stop = threading.Event()
-                def _stderr_reader_single(proc, setter, stop_evt):
-                    try:
-                        import re
-                        pat = re.compile(r"pts_time:([0-9]+\.[0-9]+)")
-                        got_first = False
-                        while not stop_evt.is_set():
-                            line = proc.stderr.readline()
-                            if not line:
-                                break
-                            if not got_first:
-                                try:
-                                    s = line.decode('utf-8', errors='ignore')
-                                except Exception:
-                                    continue
-                                m = pat.search(s)
-                                if m:
-                                    try:
-                                        val = float(m.group(1))
-                                        setter(val)
-                                        got_first = True
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-                self._stderr_reader_thread = threading.Thread(
-                    target=_stderr_reader_single,
-                    args=(self.ffmpeg_process, lambda v: setattr(self, '_first_frame_pts_time', v), self._stderr_reader_stop),
-                    name="FFmpegSegStderrReaderSingle",
-                    daemon=True,
-                )
-                self._stderr_reader_thread.start()
-                return True
-            except Exception as e:
-                self.logger.warning(f"Failed to start FFmpeg for segment: {e}", exc_info=True)
-                self.ffmpeg_process = None
-                return False
-
+        
+        
     def stream_frames_for_segment(self, start_frame_abs_idx: int, num_frames_to_read: int, stop_event: Optional[threading.Event] = None) -> Iterator[Tuple[int, np.ndarray]]:
         if num_frames_to_read <= 0:
             self.logger.warning("num_frames_to_read is not positive, no frames to stream.")
@@ -1836,7 +1689,7 @@ class VideoProcessor:
         frames_yielded = 0
         segment_ffmpeg_process = self.ffmpeg_process
         try:
-            for i in range(num_frames_to_read):
+            for _ in range(num_frames_to_read):
                 if stop_event and stop_event.is_set():
                     self.logger.info("Stop event detected in stream_frames_for_segment. Aborting stream.")
                     break
@@ -1855,8 +1708,7 @@ class VideoProcessor:
                 if len(raw_frame_bytes) < self.frame_size_bytes:
                     stderr_on_short_read = segment_ffmpeg_process.stderr.read(4096).decode(errors='ignore') if segment_ffmpeg_process.stderr else ""
                     self.logger.info(
-                        f"End of FFmpeg stream or error (read {len(raw_frame_bytes)}/{self.frame_size_bytes}) "
-                        f"after {frames_yielded} frames for segment (start {start_frame_abs_idx}). Stderr: '{stderr_on_short_read.strip()}'")
+                        f"End of FFmpeg stream or error (read {len(raw_frame_bytes)}/{self.frame_size_bytes}) after {frames_yielded} frames for segment (start {start_frame_abs_idx}). Stderr: '{stderr_on_short_read.strip()}'")
                     break
 
                 frame_np = np.frombuffer(raw_frame_bytes, dtype=np.uint8).reshape(self.yolo_input_size, self.yolo_input_size, 3)

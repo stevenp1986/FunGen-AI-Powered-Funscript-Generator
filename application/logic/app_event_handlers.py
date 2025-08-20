@@ -187,6 +187,18 @@ class AppEventHandlers:
         elif current_tracker_mode == "BEAT_MARKER":
             # Explicitly state we are skipping model checks for this non-YOLO mode
             self.logger.info("Starting Live Tracker (Beat Marker mode). Skipping model checks.", extra={'status_message': True})
+            # Beat Marker requires accurate A/V sync: ensure frames and audio come from the SAME original file.
+            try:
+                processor = self.app.processor
+                # Prefer the known original path from file_manager; fallback to processor.video_path
+                original_path = getattr(self.app.file_manager, 'video_path', None) or (processor.video_path if processor else None)
+                if processor and original_path:
+                    processor.set_active_video_source(original_path)
+                    self.logger.info(
+                        f"Beat Marker: forcing ORIGINAL video as active source for frames+audio: {original_path}")
+            except Exception:
+                # Do not block live start if this fails; logs elsewhere will help
+                pass
         
         else:
             self.logger.error(f"Unknown tracker mode for live start: {current_tracker_mode}");

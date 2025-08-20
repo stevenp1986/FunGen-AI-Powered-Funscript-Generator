@@ -1691,7 +1691,7 @@ class ROITracker:
                 if (now_ms - self.last_audio_env_dbg_log_ms) >= 250:
                     ema_dbg = getattr(self, 'beat_audio_ema', None)
                     nov_dbg = locals().get('novelty', None)
-                    self.logger.info(
+                    self.logger.debug(
                         f"BeatMarker(audio) sig={signal:.3f} ema={(ema_dbg if ema_dbg is None else float(ema_dbg)):.3f} "
                         f"nov={(0.0 if nov_dbg is None else float(nov_dbg)):.3f} avg={avg:.3f} std={std:.3f} z={z:.2f} "
                         f"thr={thr_sigma:.2f} hyst={hyster_ratio:.2f} armed={getattr(self, 'beat_armed', True)} "
@@ -1799,7 +1799,7 @@ class ROITracker:
                     get = (self.app.app_settings.get if hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
                     preview_write = bool(get('beat_preview_write_enabled', True))
                     will_write_actions = bool(self.tracking_active or preview_write)
-                self.logger.info(
+                self.logger.debug(
                     f"BeatMarker TRIGGER source={source} z={z:.2f} thr={thr_sigma:.2f} "
                     f"armed_before={(not getattr(self, 'beat_armed', False))} interval_ok={interval_ok} "
                     f"will_write_actions={will_write_actions}"
@@ -1828,7 +1828,7 @@ class ROITracker:
                 try:
                     self.logger.debug(f"BeatMarker step: toggle_high={prev_toggle} -> pos={pos} (min={amp_min}, max={amp_max})")
                     # Also log at INFO level for visibility in normal runs
-                    self.logger.info(f"BeatMarker step: toggle_high={prev_toggle} -> pos={pos} (min={amp_min}, max={amp_max})")
+                    self.logger.debug(f"BeatMarker step: toggle_high={prev_toggle} -> pos={pos} (min={amp_min}, max={amp_max})")
                 except Exception:
                     pass
                 # Flip toggle for next beat

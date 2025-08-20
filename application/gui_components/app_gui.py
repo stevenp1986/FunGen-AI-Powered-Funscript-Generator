@@ -666,7 +666,7 @@ class GUI:
             except Exception:
                 tracking_mode_str = "ERR"
             try:
-                self.app.logger.info(
+                self.app.logger.debug(
                     f"BM: needs_regen={needs_regen} dirty={app_state.funscript_preview_dirty} "
                     f"size_changed={current_bar_width_int != app_state.last_funscript_preview_bar_width} "
                     f"dur_changed={abs(total_duration_s - app_state.last_funscript_preview_duration_s) > 0.01} "
