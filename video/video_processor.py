@@ -1230,7 +1230,7 @@ class VideoProcessor:
         self.logger.info(
             f"Started GUI processing. Range: {self.processing_start_frame_limit} to "
             f"{self.processing_end_frame_limit if self.processing_end_frame_limit != -1 else 'EOS'}")
-            
+        
     def pause_processing(self):
         if not self.is_processing or self.pause_event.is_set():
             return
@@ -1464,124 +1464,154 @@ class VideoProcessor:
                 # Ensure we remain paused/stopped; do not start audio here
 
     def _processing_loop(self):
-        """
-        Core decoding loop: reads raw frames from FFmpeg stdout, updates state, and
-        starts audio on the first decoded frame after a seek using captured PTS.
-        """
-        proc = self.ffmpeg_process
-        if not proc or proc.stdout is None:
-            self.logger.warning("_processing_loop: FFmpeg process/stdout is not available.")
+        if not self.ffmpeg_process or self.ffmpeg_process.stdout is None:
+            self.logger.error("_processing_loop: FFmpeg process/stdout not available. Exiting.")
             self.is_processing = False
             return
 
-        self.logger.debug("Processing loop started.")
-        bytes_per_frame = self.frame_size_bytes
-        fps_val = float(self.video_info.get('fps', 30.0)) if self.video_info else 30.0
+        start_time = time.time()  # For calculating FPS and ETA in the callback
 
-        # Real-time pacing state (video pacing only)
-        play_base_time: Optional[float] = None
-        play_base_frame: Optional[int] = None
-        prev_paused: bool = False
+        loop_ffmpeg_process = self.ffmpeg_process
+        next_frame_target_time = time.perf_counter()
+        self.last_processed_chapter_id = None
 
         try:
+            # The main processing loop
             while not self.stop_event.is_set():
-                is_paused = self.pause_event.is_set()
-                if is_paused:
-                    prev_paused = True
+                while self.pause_event.is_set():
+                    if self.stop_event.is_set():
+                        break
                     time.sleep(0.01)
-                    continue
 
-
-                # If FFmpeg terminated, break
-                if proc.poll() is not None and proc.stdout.peek() if hasattr(proc.stdout, 'peek') else False:
-                    pass  # allow read below
-
-                raw = proc.stdout.read(bytes_per_frame)
-                if not raw or len(raw) < bytes_per_frame:
-                    # Try read some stderr for diagnostics then exit
-                    try:
-                        err = proc.stderr.read(4096).decode(errors='ignore') if proc.stderr else ""
-                        self.logger.info(f"FFmpeg stream ended or short read ({len(raw) if raw else 0}/{bytes_per_frame}). Stderr: '{err.strip()}'")
-                    except Exception:
-                        pass
+                # If a stop was requested while we were paused, break the main loop.
+                if self.stop_event.is_set():
                     break
 
-                # Convert to numpy frame (BGR)
-                try:
-                    frame_np = np.frombuffer(raw, dtype=np.uint8).reshape(self.yolo_input_size, self.yolo_input_size, 3)
-                except Exception as e:
-                    self.logger.warning(f"Failed to reshape raw frame: {e}")
+                # The original logic of the loop continues below
+                speed_mode = self.app.app_state_ui.selected_processing_speed_mode
+                if speed_mode == constants.ProcessingSpeedMode.REALTIME:
+                    target_delay = 1.0 / self.fps if self.fps > 0 else (1.0 / 30.0)
+                elif speed_mode == constants.ProcessingSpeedMode.SLOW_MOTION:
+                    target_delay = 1.0 / 10.0  # Fixed 10 FPS for slow-mo
+                else:  # Max Speed
+                    target_delay = 0.0
+
+                current_chapter = self.app.funscript_processor.get_chapter_at_frame(self.current_frame_index)
+                current_chapter_id = current_chapter.unique_id if current_chapter else None
+
+                if current_chapter_id != self.last_processed_chapter_id:
+                    if self.tracker:
+                        if current_chapter and current_chapter.user_roi_fixed:
+                            self.tracker.reconfigure_for_chapter(current_chapter)
+                            if not self.tracker.tracking_active:
+                                self.tracker.start_tracking()
+                        elif current_chapter is None and self.tracker.tracking_active:
+                            if self.tracker.tracking_mode != "USER_FIXED_ROI":
+                                self.tracker.stop_tracking()
+                                self.logger.info("Tracker stopped due to entering a gap between chapters.")
+                    self.last_processed_chapter_id = current_chapter_id
+
+                if current_chapter and self.tracker and not self.tracker.tracking_active and current_chapter.user_roi_fixed:
+                    self.tracker.start_tracking()
+
+                if self.ffmpeg_pipe1_process and self.ffmpeg_pipe1_process.poll() is not None:
+                    pipe1_stderr = self.ffmpeg_pipe1_process.stderr.read(4096).decode(
+                        errors='ignore') if self.ffmpeg_pipe1_process.stderr else ""
+                    self.logger.warning(
+                        f"FFmpeg Pipe 1 died. Exit: {self.ffmpeg_pipe1_process.returncode}. Stderr: {pipe1_stderr.strip()}. Stopping.")
+                    self.is_processing = False
                     break
 
-                # Update indices
-                abs_idx = int(self.current_stream_start_frame_abs) + int(self.frames_read_from_current_stream)
-                self.current_frame_index = abs_idx
+                if loop_ffmpeg_process.poll() is not None:
+                    stderr_output = loop_ffmpeg_process.stderr.read(4096).decode(
+                        errors='ignore') if loop_ffmpeg_process.stderr else ""
+                    self.logger.info(
+                        f"FFmpeg output process died unexpectedly. Exit: {loop_ffmpeg_process.returncode}. Stderr: {stderr_output.strip()}. Stopping.")
+                    self.is_processing = False
+                    break
+
+                raw_frame_bytes = None
+                if loop_ffmpeg_process.stdout is not None:
+                    raw_frame_bytes = loop_ffmpeg_process.stdout.read(self.frame_size_bytes)
+                raw_frame_len = len(raw_frame_bytes) if raw_frame_bytes is not None else 0
+                if not raw_frame_bytes or raw_frame_len < self.frame_size_bytes:
+                    self.logger.info(
+                        f"End of FFmpeg GUI stream or incomplete frame (read {raw_frame_len}/{self.frame_size_bytes}).")
+                    self.is_processing = False
+                    # Clear tracker processing flag when stream ends naturally
+                    self.enable_tracker_processing = False
+                    if self.app:
+                        was_scripting_at_end = self.tracker and self.tracker.tracking_active
+                        end_range = (self.processing_start_frame_limit, self.current_frame_index)
+                        self.app.on_processing_stopped(was_scripting_session=was_scripting_at_end, scripted_frame_range=end_range)
+                    break
+
+                self.current_frame_index = self.current_stream_start_frame_abs + self.frames_read_from_current_stream
                 self.frames_read_from_current_stream += 1
 
-                # Cache and publish current frame
-                with self.frame_cache_lock:
-                    if len(self.frame_cache) >= self.frame_cache_max_size:
-                        try:
-                            self.frame_cache.popitem(last=False)
-                        except KeyError:
-                            pass
-                    self.frame_cache[abs_idx] = frame_np
-                with self.frame_lock:
-                    self.current_frame = frame_np
+                if self.cli_progress_callback:
+                    # Throttle updates to avoid slowing down processing (e.g., update every 10 frames)
+                    if self.current_frame_index % 10 == 0 or self.current_frame_index == self.total_frames - 1:
+                        self.cli_progress_callback(self.current_frame_index, self.total_frames, start_time)
 
-                # Establish or adjust pacing baseline
-                now = time.monotonic()
-                if play_base_time is None or play_base_frame is None or prev_paused:
-                    play_base_time = now
-                    play_base_frame = abs_idx
-                    prev_paused = False
-
-                # Pace to real-time so video runs smoothly
-                try:
-                    expected_elapsed = (abs_idx - (play_base_frame or abs_idx)) / (fps_val if fps_val > 0 else 30.0)
-                    target_time = (play_base_time or now) + expected_elapsed
-                    delay = target_time - now
-                    if delay > 0:
-                        # Sleep the full remaining delay; do not cap to avoid running too fast
-                        time.sleep(delay)
-                except Exception:
-                    pass
-
-                # Start audio playback on first decoded frame after seek
-                if getattr(self, '_pending_audio_resync', False):
-                    try:
-                        # Always align audio start to the precise stream seek time
-                        base_seek = getattr(self, '_current_stream_seek_time_seconds', 0.0) or 0.0
-                        start_time = max(0.0, float(base_seek))
-                        self.logger.info(
-                            f"A/V sync: starting audio at seek base={base_seek:.3f}s (abs_idx={abs_idx}, fps={fps_val})")
-                        self._maybe_start_audio_playback(start_time)
-                    except Exception as e:
-                        self.logger.warning(f"Audio resync start failed: {e}")
-                    finally:
-                        self._pending_audio_resync = False
-                        self._first_frame_pts_time = None
-
-                # End-frame limit check
-                if getattr(self, 'processing_end_frame_limit', -1) != -1 and abs_idx >= self.processing_end_frame_limit:
-                    self.logger.info(f"End of requested frame range reached at {abs_idx}.")
+                if self.processing_end_frame_limit != -1 and self.current_frame_index > self.processing_end_frame_limit:
+                    self.logger.info(f"Reached GUI end_frame_limit ({self.processing_end_frame_limit}). Stopping.")
+                    self.is_processing = False
+                    # Clear tracker processing flag when reaching end frame limit naturally
+                    self.enable_tracker_processing = False
+                    if self.app:
+                        was_scripting_at_end_limit = self.tracker and self.tracker.tracking_active
+                        end_range_limit = (self.processing_start_frame_limit, self.processing_end_frame_limit)
+                        self.app.on_processing_stopped(was_scripting_session=was_scripting_at_end_limit, scripted_frame_range=end_range_limit)
+                    break
+                if self.total_frames > 0 and self.current_frame_index >= self.total_frames:
+                    self.logger.info("Reached end of video. Stopping GUI processing.")
+                    self.is_processing = False
+                    # Clear tracker processing flag when reaching end of video naturally
+                    self.enable_tracker_processing = False
+                    if self.app:
+                        was_scripting_at_eos = self.tracker and self.tracker.tracking_active
+                        end_range_eos = (self.processing_start_frame_limit, self.current_frame_index)
+                        self.app.on_processing_stopped(was_scripting_session=was_scripting_at_eos, scripted_frame_range=end_range_eos)
                     break
 
-                # No drift monitoring/resync: audio is started once per seek and left running
+                frame_np = np.frombuffer(raw_frame_bytes, dtype=np.uint8).reshape(self.yolo_input_size, self.yolo_input_size, 3)
+                processed_frame_for_gui = frame_np
+                if self.tracker and self.tracker.tracking_active:
+                    timestamp_ms = int(self.current_frame_index * (1000.0 / self.fps)) if self.fps > 0 else int(
+                        time.time() * 1000)
+                    try:
+                        processed_frame_for_gui = self.tracker.process_frame(frame_np.copy(), timestamp_ms)[0]
+                    except Exception as e:
+                        self.logger.error(f"Error in tracker.process_frame during loop: {e}", exc_info=True)
 
-            # end while
-        except Exception as e:
-            self.logger.error(f"_processing_loop encountered an error: {e}", exc_info=True)
+                with self.frame_lock:
+                    self.current_frame = processed_frame_for_gui
+
+                self.frames_for_fps_calc += 1
+                current_time_fps_calc = time.time()
+                elapsed = current_time_fps_calc - self.last_fps_update_time
+                if elapsed >= 1.0:
+                    self.actual_fps = self.frames_for_fps_calc / elapsed
+                    self.last_fps_update_time = current_time_fps_calc
+                    self.frames_for_fps_calc = 0
+
+                current_time = time.perf_counter()
+                sleep_duration = next_frame_target_time - current_time
+
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+
+                if next_frame_target_time < current_time - target_delay:
+                    next_frame_target_time = current_time + target_delay
+                else:
+                    next_frame_target_time += target_delay
         finally:
-            try:
-                self._terminate_ffmpeg_processes()
-            except Exception:
-                pass
+            self.logger.info(f"_processing_loop ending. is_processing: {self.is_processing}, stop_event: {self.stop_event.is_set()}")
+            self._terminate_ffmpeg_processes()
             self.is_processing = False
-            self.pause_event.clear()
-            self.stop_event.clear()
-            self.logger.debug("Processing loop exited and cleaned up.")
-
+            self.pause_event.set()
+            self.last_processed_chapter_id = None
         
         
     def stream_frames_for_segment(self, start_frame_abs_idx: int, num_frames_to_read: int, stop_event: Optional[threading.Event] = None) -> Iterator[Tuple[int, np.ndarray]]:
