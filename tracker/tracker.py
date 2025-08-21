@@ -1606,10 +1606,8 @@ class ROITracker:
             # Build EMA baseline and novelty for robust click detection
             try:
                 if not hasattr(self, 'beat_audio_env_history'):
-                    from collections import deque
                     self.beat_audio_env_history = deque(maxlen=400)
                 if not hasattr(self, 'beat_audio_novelty_history'):
-                    from collections import deque
                     self.beat_audio_novelty_history = deque(maxlen=200)
                 # EMA smoothing factor (configurable)
                 get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
@@ -1637,7 +1635,6 @@ class ROITracker:
 
         # Update signal history for z-score (reuse existing buffer name for simplicity)
         if not hasattr(self, 'beat_brightness_history') or self.beat_brightness_history.maxlen is None:
-            from collections import deque
             self.beat_brightness_history = deque(maxlen=60)
         self.beat_brightness_history.append(signal)
 
@@ -2338,7 +2335,6 @@ class ROITracker:
             self.logger.info("Dot Tracker started.")
         elif self.tracking_mode == "BEAT_MARKER":
             # Initialize Beat Marker state
-            from collections import deque
             self.beat_last_tick_time_ms = None
             self.beat_armed = True
             self.beat_toggle_high = True  # for step waveform toggle

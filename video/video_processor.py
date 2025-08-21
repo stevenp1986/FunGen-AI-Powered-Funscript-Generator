@@ -1110,16 +1110,9 @@ class VideoProcessor:
             return False
 
         start_time_seconds = start_frame_abs_idx / self.video_info['fps']
-        # Remember base seek time to offset showinfo pts_time (which often starts near 0 due to genpts)
-        self._current_stream_seek_time_seconds = float(max(0.0, start_time_seconds))
-        # Reset first-frame pts marker for new stream
-        self._first_frame_pts_time = None
         self.current_stream_start_frame_abs = start_frame_abs_idx
         self.frames_read_from_current_stream = 0
-        # Mark that we should resync audio when the first frame is actually received
-        self._pending_audio_resync = True
-        # Use info level so showinfo prints PTS to stderr for parsing
-        common_ffmpeg_prefix = ['ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'info']
+        common_ffmpeg_prefix = ['ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'error']
 
         if self._is_10bit_cuda_pipe_needed():
             self.logger.info("Using 2-pipe FFmpeg command for 10-bit CUDA video.")
@@ -1132,9 +1125,8 @@ class VideoProcessor:
             pipe1_vf = f"crop={int(video_height_for_crop)}:{int(video_height_for_crop)}:0:0,scale_cuda=1000:1000"
             cmd1 = common_ffmpeg_prefix[:]
             cmd1.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
-            cmd1.extend(['-i', self._active_video_source_path])
-            if start_time_seconds > 0.001: cmd1.extend(['-ss', f"{start_time_seconds:.3f}"])  # accurate seek only
-            cmd1.extend(['-an', '-sn', '-vf', pipe1_vf])
+            if start_time_seconds > 0.001: cmd1.extend(['-ss', str(start_time_seconds)])
+            cmd1.extend(['-i', self._active_video_source_path, '-an', '-sn', '-vf', pipe1_vf])
             if num_frames_to_output_ffmpeg and num_frames_to_output_ffmpeg > 0:
                  cmd1.extend(['-frames:v', str(num_frames_to_output_ffmpeg)])
             cmd1.extend(['-c:v', 'hevc_nvenc', '-preset', 'fast', '-qp', '0', '-f', 'matroska', 'pipe:1'])
@@ -1142,8 +1134,7 @@ class VideoProcessor:
             cmd2 = common_ffmpeg_prefix[:]
             cmd2.extend(['-hwaccel', 'cuda', '-i', 'pipe:0', '-an', '-sn'])
             effective_vf_pipe2 = self.ffmpeg_filter_string or f"scale={self.yolo_input_size}:{self.yolo_input_size}"
-            # Append showinfo to capture pts_time in stderr for accurate A/V resync after seek
-            cmd2.extend(['-vf', f"{effective_vf_pipe2},showinfo"]) 
+            cmd2.extend(['-vf', effective_vf_pipe2])
             if num_frames_to_output_ffmpeg and num_frames_to_output_ffmpeg > 0:
                 cmd2.extend(['-frames:v', str(num_frames_to_output_ffmpeg)])
             cmd2.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
@@ -1157,38 +1148,6 @@ class VideoProcessor:
                     raise IOError("Pipe 1 stdout is None.")
                 self.ffmpeg_process = subprocess.Popen(cmd2, stdin=self.ffmpeg_pipe1_process.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_size_bytes * 5, creationflags=creation_flags)
                 self.ffmpeg_pipe1_process.stdout.close()
-                # Start stderr reader to capture first pts_time from showinfo
-                self._first_frame_pts_time = None
-                self._stderr_reader_stop = threading.Event()
-                def _stderr_reader(proc, setter, stop_evt):
-                    # Drain stderr continuously to avoid FFmpeg blocking if pipe fills.
-                    # Capture first pts_time via setter, then keep discarding lines.
-                    try:
-                        import re
-                        pat = re.compile(r"pts_time:([0-9]+\.[0-9]+)")
-                        got_first = False
-                        while not stop_evt.is_set():
-                            line = proc.stderr.readline()
-                            if not line:
-                                break
-                            if not got_first:
-                                try:
-                                    s = line.decode('utf-8', errors='ignore')
-                                except Exception:
-                                    continue
-                                m = pat.search(s)
-                                if m:
-                                    try:
-                                        val = float(m.group(1))
-                                        setter(val)
-                                        got_first = True
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-                self._stderr_reader_thread = threading.Thread(target=_stderr_reader, args=(self.ffmpeg_process, lambda v: setattr(self, '_first_frame_pts_time', v), self._stderr_reader_stop), name="FFmpegStderrReader")
-                self._stderr_reader_thread.daemon = True
-                self._stderr_reader_thread.start()
                 return True
             except Exception as e:
                 self.logger.error(f"Failed to start 2-pipe FFmpeg: {e}", exc_info=True)
@@ -1197,59 +1156,20 @@ class VideoProcessor:
         else:
             # Standard single FFmpeg process
             hwaccel_cmd_list = self._get_ffmpeg_hwaccel_args()
-            # On macOS, disable hwaccel for non-zero seeks to avoid keyframe-only behavior causing large desync
-            if sys.platform == 'darwin' and start_time_seconds > 0.001:
-                if '-hwaccel' in hwaccel_cmd_list:
-                    self.logger.info("macOS seek detected: disabling hardware decode for accurate seek.")
-                hwaccel_cmd_list = []
             ffmpeg_input_options = hwaccel_cmd_list[:]
+            if start_time_seconds > 0.001: ffmpeg_input_options.extend(['-ss', str(start_time_seconds)])
 
-            cmd = common_ffmpeg_prefix + ffmpeg_input_options + ['-i', self._active_video_source_path]
-            if start_time_seconds > 0.001: cmd.extend(['-ss', f"{start_time_seconds:.3f}"])  # accurate seek only
-            cmd.extend(['-an', '-sn'])
+            cmd = common_ffmpeg_prefix + ffmpeg_input_options + ['-i', self._active_video_source_path, '-an', '-sn']
             effective_vf = self.ffmpeg_filter_string or f"scale={self.yolo_input_size}:{self.yolo_input_size}"
-            # Append showinfo to capture pts_time in stderr for accurate A/V resync after seek
-            cmd.extend(['-vf', f"{effective_vf},showinfo"]) 
+            cmd.extend(['-vf', effective_vf])
             if num_frames_to_output_ffmpeg and num_frames_to_output_ffmpeg > 0:
                 cmd.extend(['-frames:v', str(num_frames_to_output_ffmpeg)])
-            cmd.extend(['-fflags', '+genpts', '-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
+            cmd.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
 
             self.logger.info(f"Single Pipe CMD: {' '.join(shlex.quote(str(x)) for x in cmd)}")
             try:
                 creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                 self.ffmpeg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_size_bytes * 5, creationflags=creation_flags)
-                # Start stderr reader to capture first pts_time from showinfo
-                self._first_frame_pts_time = None
-                self._stderr_reader_stop = threading.Event()
-                def _stderr_reader(proc, setter, stop_evt):
-                    # Drain stderr continuously to avoid FFmpeg blocking if pipe fills.
-                    # Capture first pts_time via setter, then keep discarding lines.
-                    try:
-                        import re
-                        pat = re.compile(r"pts_time:([0-9]+\.[0-9]+)")
-                        got_first = False
-                        while not stop_evt.is_set():
-                            line = proc.stderr.readline()
-                            if not line:
-                                break
-                            if not got_first:
-                                try:
-                                    s = line.decode('utf-8', errors='ignore')
-                                except Exception:
-                                    continue
-                                m = pat.search(s)
-                                if m:
-                                    try:
-                                        val = float(m.group(1))
-                                        setter(val)
-                                        got_first = True
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-                self._stderr_reader_thread = threading.Thread(target=_stderr_reader, args=(self.ffmpeg_process, lambda v: setattr(self, '_first_frame_pts_time', v), self._stderr_reader_stop), name="FFmpegStderrReader")
-                self._stderr_reader_thread.daemon = True
-                self._stderr_reader_thread.start()
                 return True
             except Exception as e:
                 self.logger.error(f"Failed to start FFmpeg: {e}", exc_info=True)
@@ -1264,13 +1184,6 @@ class VideoProcessor:
             # Optional: callback to notify the main app UI
             if self.app and hasattr(self.app, 'on_processing_resumed'):
                 self.app.on_processing_resumed()
-            # Also resume audio playback from current timestamp
-            try:
-                fps_val = self.video_info.get('fps', 30.0) if self.video_info else 30.0
-                start_time_seconds = max(0.0, float(self.current_frame_index or 0) / float(fps_val if fps_val > 0 else 30.0))
-                self._maybe_start_audio_playback(start_time_seconds)
-            except Exception as e:
-                self.logger.warning(f"Failed to resume audio playback: {e}")
             return
 
         if self.is_processing:
@@ -1317,13 +1230,7 @@ class VideoProcessor:
         self.logger.info(
             f"Started GUI processing. Range: {self.processing_start_frame_limit} to "
             f"{self.processing_end_frame_limit if self.processing_end_frame_limit != -1 else 'EOS'}")
-
-        # Defer audio start until first decoded frame to avoid early playback and desync
-        try:
-            self._stop_audio_playback()
-        except Exception:
-            pass
-
+            
     def pause_processing(self):
         if not self.is_processing or self.pause_event.is_set():
             return

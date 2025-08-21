@@ -422,33 +422,88 @@ class ApplicationLogic:
             self.logger.warning(f"Failed to set logging level or invalid level: {level_name}")
 
     def _apply_loaded_settings(self):
-        """Applies core settings from AppSettings to runtime components."""
+        """Applies all settings from AppSettings to their respective modules/attributes."""
         self.logger.debug("Applying loaded settings...")
-        try:
-            defaults = self.app_settings.get_default_settings()
-        except Exception:
-            defaults = {}
+        defaults = self.app_settings.get_default_settings()
+
+        self.discarded_tracking_classes = self.app_settings.get("discarded_tracking_classes", defaults.get("discarded_tracking_classes")) or []
 
         # Logging Level
         new_logging_level = self.app_settings.get("logging_level", defaults.get("logging_level")) or "INFO"
         if self.logging_level_setting != new_logging_level:
             self.set_application_logging_level(new_logging_level)
 
+        # Hardware Acceleration
+        default_hw_accel_in_apply = "auto"
+        if "auto" not in self.available_ffmpeg_hwaccels:
+            default_hw_accel_in_apply = "none" if "none" in self.available_ffmpeg_hwaccels else \
+                (self.available_ffmpeg_hwaccels[0] if self.available_ffmpeg_hwaccels else "none")
+        loaded_hw_method = self.app_settings.get("hardware_acceleration_method", defaults.get("hardware_acceleration_method")) or default_hw_accel_in_apply
+        if loaded_hw_method not in self.available_ffmpeg_hwaccels:
+            self.logger.warning(
+                f"Hardware acceleration method '{loaded_hw_method}' from settings is not currently available "
+                f"({self.available_ffmpeg_hwaccels}). Resetting to '{default_hw_accel_in_apply}'.")
+            self.hardware_acceleration_method = default_hw_accel_in_apply
+        else:
+            self.hardware_acceleration_method = loaded_hw_method
+
+        # Models
+        self.yolo_detection_model_path_setting = self.app_settings.get("yolo_det_model_path", defaults.get("yolo_det_model_path"))
+        self.yolo_pose_model_path_setting = self.app_settings.get("yolo_pose_model_path", defaults.get("yolo_pose_model_path"))
+
+        # Update actual model paths used by tracker/processor if they changed
+        if self.yolo_det_model_path != self.yolo_detection_model_path_setting:
+            self.yolo_det_model_path = self.yolo_detection_model_path_setting or ""
+            if self.tracker: self.tracker.det_model_path = self.yolo_det_model_path
+            self.logger.info(
+                f"Detection model path updated from settings: {os.path.basename(self.yolo_det_model_path or '')}")
+        if self.yolo_pose_model_path != self.yolo_pose_model_path_setting:
+            self.yolo_pose_model_path = self.yolo_pose_model_path_setting or ""
+            if self.tracker: self.tracker.pose_model_path = self.yolo_pose_model_path
+            self.logger.info(
+                f"Pose model path updated from settings: {os.path.basename(self.yolo_pose_model_path or '')}")
+
+        # Tracker: apply omni-axis smoothing factor
+        try:
+            omni_alpha = self.app_settings.get("omni_axis_alpha", defaults.get("omni_axis_alpha", 0.2))
+            if self.tracker and hasattr(self.tracker, "omni_axis_alpha"):
+                self.tracker.omni_axis_alpha = omni_alpha
+        except Exception:
+            pass
+
+        # Note: Do not update sub-modules here; they may not be initialized yet during __init__.
+        # Sub-module settings are applied later in _apply_loaded_settings().
+
         # Inform sub-modules to update their settings
-        if hasattr(self, 'app_state_ui'):
-            self.app_state_ui.update_settings_from_app()
-        if hasattr(self, 'file_manager'):
-            self.file_manager.update_settings_from_app()
-        if hasattr(self, 'stage_processor'):
-            self.stage_processor.update_settings_from_app()
-        if hasattr(self, 'calibration'):
-            self.calibration.update_settings_from_app()
-        if hasattr(self, 'energy_saver'):
-            self.energy_saver.update_settings_from_app()
-        if hasattr(self, 'calibration'):
-            self.calibration.update_tracker_delay_params()
-        if hasattr(self, 'energy_saver'):
-            self.energy_saver.reset_activity_timer()
+        # TODO: Refactor this to use tuple unpacking
+        self.app_state_ui.update_settings_from_app()
+        self.file_manager.update_settings_from_app()
+        self.stage_processor.update_settings_from_app()
+        self.calibration.update_settings_from_app()
+        self.energy_saver.update_settings_from_app()
+        self.calibration.update_tracker_delay_params()
+        self.energy_saver.reset_activity_timer()
+
+    def save_app_settings(self):
+        """Saves current application settings to file via AppSettings."""
+        self.logger.debug("Saving application settings...")
+
+        # Core settings directly on AppLogic
+        self.app_settings.set("hardware_acceleration_method", self.hardware_acceleration_method)
+        self.app_settings.set("yolo_det_model_path", self.yolo_detection_model_path_setting)
+        self.app_settings.set("yolo_pose_model_path", self.yolo_pose_model_path_setting)
+        self.app_settings.set("discarded_tracking_classes", self.discarded_tracking_classes)
+
+        # Call save methods on sub-modules
+        # TODO: Refactor this to use tuple unpacking
+        self.app_state_ui.save_settings_to_app()
+        self.file_manager.save_settings_to_app()
+        self.stage_processor.save_settings_to_app()
+        self.calibration.save_settings_to_app()
+        self.energy_saver.save_settings_to_app()
+        self.app_settings.save_settings()
+        self.logger.info("Application settings saved.", extra={'status_message': True})
+        self.energy_saver.reset_activity_timer()
 
     def trigger_first_run_setup(self):
         """Initiates the first-run model download process in a background thread."""
@@ -1606,47 +1661,7 @@ class ApplicationLogic:
                 "Warning: YOLO Pose Model not found or path not set. Pose-dependent features will be disabled.",
                 extra={'status_message': True, 'duration': 8.0}
             )
-
-        # Hardware Acceleration
-        default_hw_accel_in_apply = "auto"
-        if "auto" not in self.available_ffmpeg_hwaccels:
-            default_hw_accel_in_apply = "none" if "none" in self.available_ffmpeg_hwaccels else \
-                (self.available_ffmpeg_hwaccels[0] if self.available_ffmpeg_hwaccels else "none")
-        loaded_hw_method = self.app_settings.get("hardware_acceleration_method", self.hardware_acceleration_method) or default_hw_accel_in_apply
-        if loaded_hw_method not in self.available_ffmpeg_hwaccels:
-            self.logger.warning(
-                f"Hardware acceleration method '{loaded_hw_method}' from settings is not currently available "
-                f"({self.available_ffmpeg_hwaccels}). Resetting to '{default_hw_accel_in_apply}'.")
-            self.hardware_acceleration_method = default_hw_accel_in_apply
-        else:
-            self.hardware_acceleration_method = loaded_hw_method
-
-        # Models
-        self.yolo_detection_model_path_setting = self.app_settings.get("yolo_det_model_path")
-        self.yolo_pose_model_path_setting = self.app_settings.get("yolo_pose_model_path")
-
-        # Update actual model paths used by tracker/processor if they changed
-        if self.yolo_det_model_path != self.yolo_detection_model_path_setting:
-            self.yolo_det_model_path = self.yolo_detection_model_path_setting or ""
-            if self.tracker: self.tracker.det_model_path = self.yolo_det_model_path
-            self.logger.info(
-                f"Detection model path updated from settings: {os.path.basename(self.yolo_det_model_path or '')}")
-        if self.yolo_pose_model_path != self.yolo_pose_model_path_setting:
-            self.yolo_pose_model_path = self.yolo_pose_model_path_setting or ""
-            if self.tracker: self.tracker.pose_model_path = self.yolo_pose_model_path
-            self.logger.info(
-                f"Pose model path updated from settings: {os.path.basename(self.yolo_pose_model_path or '')}")
-
-        # Tracker: apply omni-axis smoothing factor
-        try:
-            omni_alpha = self.app_settings.get("omni_axis_alpha", 0.2)
-            if self.tracker and hasattr(self.tracker, "omni_axis_alpha"):
-                self.tracker.omni_axis_alpha = omni_alpha
-        except Exception:
-            pass
-
-        # Note: Do not update sub-modules here; they may not be initialized yet during __init__.
-        # Sub-module settings are applied later in _apply_loaded_settings().
+        return True
 
     def save_app_settings(self):
         """Saves current application settings to file via AppSettings."""
