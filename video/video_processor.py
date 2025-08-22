@@ -1186,11 +1186,12 @@ class VideoProcessor:
             # Optional: callback to notify the main app UI
             if self.app and hasattr(self.app, 'on_processing_resumed'):
                 self.app.on_processing_resumed()
-            # Restart audio aligned to the current frame when resuming
+            # Defer audio start until the first decoded frame to align with GUI/tracker readiness
             try:
-                fps = float(self.fps) if self.fps and self.fps > 0 else 0.0
-                start_t = (self.current_frame_index / fps) if fps > 0 else 0.0
-                self._maybe_start_audio_playback(start_t)
+                self._pending_audio_resync = True
+                # Reset audio debug/gating state
+                self._audio_debug_t0_start = time.monotonic()
+                self._frames_since_tracking_active = None
             except Exception:
                 pass
             return
@@ -1236,16 +1237,12 @@ class VideoProcessor:
         self.processing_thread.daemon = True
         self.processing_thread.start()
 
-        # Start audio playback aligned to the processing start time
+        # Defer audio start until the first decoded frame to avoid starting before video shows
         try:
-            fps = float(self.fps) if self.fps and self.fps > 0 else 0.0
-            start_t = (self.processing_start_frame_limit / fps) if fps > 0 else 0.0
-            self._maybe_start_audio_playback(start_t)
-            # Clear any pending resync flag now that audio has been explicitly started
-            try:
-                self._pending_audio_resync = False
-            except Exception:
-                pass
+            self._pending_audio_resync = True
+            # Reset audio debug/gating state
+            self._audio_debug_t0_start = time.monotonic()
+            self._frames_since_tracking_active = None
         except Exception:
             pass
 
@@ -1608,6 +1605,11 @@ class VideoProcessor:
 
                 if current_chapter and self.tracker and not self.tracker.tracking_active and current_chapter.user_roi_fixed:
                     self.tracker.start_tracking()
+                    # Initialize gating counter on activation
+                    try:
+                        self._frames_since_tracking_active = 0
+                    except Exception:
+                        pass
 
                 if self.ffmpeg_pipe1_process and self.ffmpeg_pipe1_process.poll() is not None:
                     pipe1_stderr = self.ffmpeg_pipe1_process.stderr.read(4096).decode(
@@ -1682,6 +1684,52 @@ class VideoProcessor:
 
                 with self.frame_lock:
                     self.current_frame = processed_frame_for_gui
+
+                # Start audio once, after the first frame is available, to avoid early playback
+                try:
+                    # Update first-frame timestamp for diagnostics
+                    if getattr(self, '_audio_debug_t1_first_frame', None) is None:
+                        try:
+                            self._audio_debug_t1_first_frame = time.monotonic()
+                        except Exception:
+                            pass
+
+                    if getattr(self, '_pending_audio_resync', False):
+                        # If tracking is active, wait a couple of frames to allow initialization cost to settle
+                        try:
+                            if self.tracker and self.tracker.tracking_active:
+                                if self._frames_since_tracking_active is None:
+                                    self._frames_since_tracking_active = 0
+                                if self._frames_since_tracking_active < 2:
+                                    # Diagnostic log (throttled by frame count) to show why audio start is deferred
+                                    if self._frames_since_tracking_active == 0:
+                                        self.logger.info("[AUDIO] Deferring start until tracker has processed a few frames...")
+                                    self._frames_since_tracking_active += 1
+                                    raise RuntimeError("defer_audio_for_tracker")
+                        except RuntimeError as _defer_marker:
+                            # Skip starting audio this iteration
+                            pass
+                        except Exception:
+                            # If any issue with gating logic, proceed to start audio
+                            pass
+
+                        # Proceed to start audio now
+                        fps_val = float(self.fps) if self.fps and self.fps > 0 else 0.0
+                        start_time_sec = (self.current_frame_index / fps_val) if fps_val > 0 else 0.0
+                        # Diagnostic: timing deltas
+                        try:
+                            t0 = getattr(self, '_audio_debug_t0_start', None)
+                            t1 = getattr(self, '_audio_debug_t1_first_frame', None)
+                            now = time.monotonic()
+                            if t0 is not None and t1 is not None:
+                                self.logger.info(f"[AUDIO] start_debug: dt_start_to_first_frame={(t1 - t0):.3f}s, dt_first_to_audio={(now - t1):.3f}s, tracker_active={bool(self.tracker and self.tracker.tracking_active)}")
+                        except Exception:
+                            pass
+
+                        self._maybe_start_audio_playback(start_time_sec)
+                        self._pending_audio_resync = False
+                except Exception:
+                    pass
 
                 self.frames_for_fps_calc += 1
                 current_time_fps_calc = time.time()
