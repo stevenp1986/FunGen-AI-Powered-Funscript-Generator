@@ -119,9 +119,11 @@ class SoundDevicePyAVAudioBackend:
                         break
                     if nxt.dtype != np.float32:
                         nxt = nxt.astype(np.float32, copy=False)
+                    # Apply volume then hard-clip to avoid overdrive
                     if self._vol != 1.0:
                         nxt *= self._vol
-                        np.clip(nxt, -1.0, 1.0, out=nxt)
+                    # Clip regardless, in case upstream amplitude exceeds 1.0
+                    np.clip(nxt, -1.0, 1.0, out=nxt)
                     # Ensure channels match
                     if nxt.ndim == 1:
                         nxt = nxt.reshape(-1, 1)
@@ -146,8 +148,8 @@ class SoundDevicePyAVAudioBackend:
                 channels=target_channels,
                 dtype='float32',
                 callback=callback,
-                blocksize=0,  # let driver choose
-                latency='low',
+                # Use a moderate block size for stability across devices
+                blocksize=512,
             )
 
             def worker():
@@ -158,9 +160,9 @@ class SoundDevicePyAVAudioBackend:
                             self._q.get_nowait()
                     except Exception:
                         pass
-                    # Start stream immediately; callback will output silence until data arrives
-                    self._stream.start()
-                    self._running = True
+                    # Prebuffer ~100ms of audio before starting the stream to avoid initial underflow
+                    prebuffer_target_frames = int(0.10 * target_rate)
+                    queued_frames = 0
                     for packet in container.demux(stream):
                         if self._stop_evt.is_set():
                             break
@@ -230,10 +232,27 @@ class SoundDevicePyAVAudioBackend:
                                     while pos < total:
                                         end = min(pos + block, total)
                                         self._q.put(pcm[pos:end, :], timeout=0.5)
+                                        # Track prebuffer fill
+                                        queued_frames += (end - pos)
                                         pos = end
                                 except queue.Full:
                                     # Drop if output can't keep up
                                     pass
+                            # Start the stream once we've prebuffered enough (one-time)
+                            if not self._running and queued_frames >= prebuffer_target_frames:
+                                try:
+                                    self._stream.start()
+                                    self._running = True
+                                except Exception:
+                                    # If start fails, try again next iteration
+                                    pass
+                    # If demux loop ended without starting (short file), try to start anyway
+                    if not self._running:
+                        try:
+                            self._stream.start()
+                            self._running = True
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.logger.warning(f"Audio backend worker error: {e}")
                 finally:
