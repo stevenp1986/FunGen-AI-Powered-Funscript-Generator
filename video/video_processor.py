@@ -133,6 +133,8 @@ class VideoProcessor:
                 self._audio_backend = SoundDevicePyAVAudioBackend(self.logger)
         except Exception:
             self._audio_backend = None
+        # One-time audio module usage log guard
+        self._audio_logged_once: bool = False
         # Effective envelope rate (derived from integer window size)
         self._audio_env_effective_rate_hz: float = float(self._audio_env_rate_hz)
 
@@ -1184,6 +1186,13 @@ class VideoProcessor:
             # Optional: callback to notify the main app UI
             if self.app and hasattr(self.app, 'on_processing_resumed'):
                 self.app.on_processing_resumed()
+            # Restart audio aligned to the current frame when resuming
+            try:
+                fps = float(self.fps) if self.fps and self.fps > 0 else 0.0
+                start_t = (self.current_frame_index / fps) if fps > 0 else 0.0
+                self._maybe_start_audio_playback(start_t)
+            except Exception:
+                pass
             return
 
         if self.is_processing:
@@ -1226,6 +1235,19 @@ class VideoProcessor:
         self.processing_thread = threading.Thread(target=self._processing_loop, name="VideoProcessingThread")
         self.processing_thread.daemon = True
         self.processing_thread.start()
+
+        # Start audio playback aligned to the processing start time
+        try:
+            fps = float(self.fps) if self.fps and self.fps > 0 else 0.0
+            start_t = (self.processing_start_frame_limit / fps) if fps > 0 else 0.0
+            self._maybe_start_audio_playback(start_t)
+            # Clear any pending resync flag now that audio has been explicitly started
+            try:
+                self._pending_audio_resync = False
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         self.logger.info(
             f"Started GUI processing. Range: {self.processing_start_frame_limit} to "
@@ -1320,27 +1342,25 @@ class VideoProcessor:
         """
         try:
             # Preconditions
-            if not self.video_path or not self.video_info or not self.video_info.get("has_audio"):
+            if not self.video_path or not self.video_info:
+                if not getattr(self, '_audio_logged_once', False):
+                    self.logger.warning("[AUDIO] Skipping start: no loaded video/info")
                 return
+            if not self.video_info.get("has_audio"):
+                # If the main video has no audio, we'll still attempt chosen_source check below,
+                # but warn here for visibility since many flows rely on this flag.
+                self.logger.warning("[AUDIO] Video reports no audio stream; will attempt fallback source selection")
             get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
             if not bool(get('audio_playback_enabled', True)):
                 self._stop_audio_playback()
+                self.logger.warning("[AUDIO] Audio playback disabled in settings; not starting")
                 return
 
             # Use SoundDevice+PyAV backend if available
             backend = getattr(self, '_audio_backend', None)
-            if backend is None or not getattr(backend, 'available', False):
-                self.logger.info("Audio backend unavailable; skipping playback.")
-                self._audio_play_process = None
-                self._audio_last_start_media_time = None
-                self._audio_last_start_wallclock = None
-                return
-
             # Volume
             vol_setting = int(get('audio_volume', 100) or 100)
             vol_setting = max(0, min(100, vol_setting))
-            backend.set_volume(vol_setting / 100.0)
-
             # Start time with optional compensation/offset
             offset_ms = int(get('audio_playback_offset_ms', 0) or 0)
             compensation_ms = int(get('audio_sync_comp_ms', 0) or 0)
@@ -1354,14 +1374,76 @@ class VideoProcessor:
                 return self.video_path
 
             chosen_source = choose_audio_source()
+            # Validate chosen source actually has audio
+            if not self._path_has_audio_stream(chosen_source):
+                self.logger.warning(f"[AUDIO] Chosen source has no audio stream: {os.path.basename(chosen_source)}")
+                return
+
+            if backend is None or not getattr(backend, 'available', False):
+                # Fallback to ffplay if backend missing/unavailable
+                self.logger.info("Audio backend unavailable; falling back to ffplay playback.")
+                try:
+                    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    cmd = [
+                        'ffplay', '-nodisp', '-autoexit', '-loglevel', 'warning',
+                        '-vn', '-ss', f"{effective_start_time:.3f}",
+                        '-volume', str(int(vol_setting)),
+                        chosen_source
+                    ]
+                    # Orange (WARNING) log to clearly indicate module in use
+                    if not getattr(self, '_audio_logged_once', False):
+                        self.logger.warning("[AUDIO] Using ffplay subprocess for audio playback")
+                        self._audio_logged_once = True
+                    self._audio_play_process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags
+                    )
+                    self._audio_last_start_media_time = float(effective_start_time)
+                    self._audio_last_start_wallclock = time.monotonic()
+                    self.logger.info(f"ffplay started from {os.path.basename(chosen_source)} at t={effective_start_time:.3f}s, volume={vol_setting}%")
+                except Exception as e:
+                    self.logger.warning(f"ffplay failed to start: {e}")
+                    self._audio_play_process = None
+                    self._audio_last_start_media_time = None
+                    self._audio_last_start_wallclock = None
+                return
+
+            backend.set_volume(vol_setting / 100.0)
+            # Orange (WARNING) log to clearly indicate module in use
+            if not getattr(self, '_audio_logged_once', False):
+                self.logger.warning("[AUDIO] Using SoundDevice+PyAV backend for audio playback")
+                self._audio_logged_once = True
             self.logger.info(f"Audio backend starting from {os.path.basename(chosen_source)} at t={effective_start_time:.3f}s, volume={vol_setting}%")
 
             # Restart backend from desired position
             try:
                 backend.start(chosen_source, effective_start_time)
             except Exception as e:
-                self.logger.warning(f"Audio backend failed to start: {e}")
-                self._audio_play_process = None
+                self.logger.warning(f"Audio backend failed to start: {e}; attempting ffplay fallback.")
+                try:
+                    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    cmd = [
+                        'ffplay', '-nodisp', '-autoexit', '-loglevel', 'warning',
+                        '-vn', '-ss', f"{effective_start_time:.3f}",
+                        '-volume', str(int(vol_setting)),
+                        chosen_source
+                    ]
+                    self._audio_play_process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags
+                    )
+                    self._audio_last_start_media_time = float(effective_start_time)
+                    self._audio_last_start_wallclock = time.monotonic()
+                    self.logger.info(f"ffplay started from {os.path.basename(chosen_source)} at t={effective_start_time:.3f}s, volume={vol_setting}%")
+                except Exception as e2:
+                    self.logger.warning(f"ffplay failed to start: {e2}")
+                    self._audio_play_process = None
                 return
 
             # Record audio start timing for drift monitoring, and set sentinel to indicate playback active
@@ -1382,6 +1464,19 @@ class VideoProcessor:
             backend = getattr(self, '_audio_backend', None)
             if backend is not None:
                 backend.stop()
+        except Exception:
+            pass
+        # Stop legacy ffplay subprocess if present
+        try:
+            if isinstance(self._audio_play_process, subprocess.Popen):
+                try:
+                    self._audio_play_process.terminate()
+                except Exception:
+                    pass
+                try:
+                    self._audio_play_process.kill()
+                except Exception:
+                    pass
         except Exception:
             pass
         # Clear legacy/sentinel state

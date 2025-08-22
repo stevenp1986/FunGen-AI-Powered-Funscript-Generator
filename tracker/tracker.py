@@ -1597,44 +1597,75 @@ class ROITracker:
                 patch = gray[y1:y2, x1:x2]
             signal = float(np.mean(patch)) if patch.size > 0 else 0.0
         elif source == "audio":
-            # Query audio envelope at current media time
-            if hasattr(self.app, 'processor') and self.app.processor is not None:
-                try:
-                    signal = float(self.app.processor.get_audio_envelope_value(frame_time_ms))
-                except Exception as e:
-                    self.logger.warning(f"Audio envelope unavailable: {e}")
-                    signal = 0.0
-            else:
-                signal = 0.0
-            # Build EMA baseline and novelty for robust click detection
+            # Prefer drift-free analyzer backed by VideoProcessor envelope; fallback to inline
+            analyzer_used = False
             try:
-                if not hasattr(self, 'beat_audio_env_history'):
-                    self.beat_audio_env_history = deque(maxlen=400)
-                if not hasattr(self, 'beat_audio_novelty_history'):
-                    self.beat_audio_novelty_history = deque(maxlen=200)
-                # EMA smoothing factor (configurable)
-                get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
-                ema_alpha = float(get('beat_audio_ema_alpha', 0.2))
-                ema_alpha = max(0.01, min(0.9, ema_alpha))
-                # Update EMA
-                if getattr(self, 'beat_audio_ema', None) is None:
-                    self.beat_audio_ema = float(signal)
-                else:
-                    self.beat_audio_ema = (1.0 - ema_alpha) * float(self.beat_audio_ema) + ema_alpha * float(signal)
-                novelty = max(0.0, float(signal) - float(self.beat_audio_ema))
-                self.beat_audio_env_history.append(float(signal))
-                self.beat_audio_novelty_history.append(float(novelty))
-                # Track derivative of novelty (onset detector)
-                prev_nov = getattr(self, 'beat_audio_last_novelty', None)
-                if prev_nov is None:
-                    self.beat_audio_last_novelty = float(novelty)
-                    novelty_deriv = 0.0
-                else:
-                    novelty_deriv = float(novelty) - float(prev_nov)
-                    self.beat_audio_last_novelty = float(novelty)
+                if not hasattr(self, 'audio_beat_analyzer') or self.audio_beat_analyzer is None:
+                    self.audio_beat_analyzer = AudioBeatAnalyzer(self.app)
+                media_time_for_audio = float(frame_time_ms) - float(audio_latency_ms_cfg)
+                sig, nov, nov_deriv, z_a, z_deriv_a = self.audio_beat_analyzer.update(media_time_for_audio)
+                signal = float(sig)
+                novelty = float(nov)
+                novelty_deriv = float(nov_deriv)
+                z = float(z_a)
+                z_deriv = float(z_deriv_a)
+                analyzer_used = True
+                # Log once to confirm analyzer path is active
+                if not hasattr(self, '_beat_analyzer_logged') or not self._beat_analyzer_logged:
+                    self.logger.info("Beat Marker(audio): using AudioBeatAnalyzer for envelope/novelty.")
+                    self._beat_analyzer_logged = True
             except Exception:
-                novelty = max(0.0, float(signal))
-                novelty_deriv = 0.0
+                analyzer_used = False
+            if not analyzer_used:
+                # Query audio envelope at current media time
+                if hasattr(self.app, 'processor') and self.app.processor is not None:
+                    try:
+                        signal = float(self.app.processor.get_audio_envelope_value(frame_time_ms))
+                    except Exception as e:
+                        self.logger.warning(f"Audio envelope unavailable: {e}")
+                        signal = 0.0
+                else:
+                    signal = 0.0
+                # Build EMA baseline and novelty for robust click detection
+                try:
+                    if not hasattr(self, 'beat_audio_env_history'):
+                        self.beat_audio_env_history = deque(maxlen=400)
+                    if not hasattr(self, 'beat_audio_novelty_history'):
+                        self.beat_audio_novelty_history = deque(maxlen=200)
+                    # EMA smoothing factor (configurable)
+                    get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
+                    ema_alpha = float(get('beat_audio_ema_alpha', 0.2))
+                    ema_alpha = max(0.01, min(0.9, ema_alpha))
+                    # Update EMA
+                    if getattr(self, 'beat_audio_ema', None) is None:
+                        self.beat_audio_ema = float(signal)
+                    else:
+                        self.beat_audio_ema = (1.0 - ema_alpha) * float(self.beat_audio_ema) + ema_alpha * float(signal)
+                    novelty = max(0.0, float(signal) - float(self.beat_audio_ema))
+                    self.beat_audio_env_history.append(float(signal))
+                    self.beat_audio_novelty_history.append(float(novelty))
+                    # Track derivative of novelty (onset detector)
+                    prev_nov = getattr(self, 'beat_audio_last_novelty', None)
+                    if prev_nov is None:
+                        self.beat_audio_last_novelty = float(novelty)
+                        novelty_deriv = 0.0
+                    else:
+                        novelty_deriv = float(novelty) - float(prev_nov)
+                        self.beat_audio_last_novelty = float(novelty)
+                except Exception:
+                    novelty = max(0.0, float(signal))
+                    novelty_deriv = 0.0
+            else:
+                # Keep histories in sync for stats/percentile thresholds
+                try:
+                    if not hasattr(self, 'beat_audio_env_history'):
+                        self.beat_audio_env_history = deque(maxlen=400)
+                    if not hasattr(self, 'beat_audio_novelty_history'):
+                        self.beat_audio_novelty_history = deque(maxlen=200)
+                    self.beat_audio_env_history.append(float(signal))
+                    self.beat_audio_novelty_history.append(float(novelty))
+                except Exception:
+                    pass
 
         # Update signal history for z-score (reuse existing buffer name for simplicity)
         if not hasattr(self, 'beat_brightness_history') or self.beat_brightness_history.maxlen is None:
@@ -1644,21 +1675,26 @@ class ROITracker:
         # Stats baseline (default: raw signal history)
         avg = float(np.mean(self.beat_brightness_history)) if len(self.beat_brightness_history) > 0 else signal
         std = float(np.std(self.beat_brightness_history)) if len(self.beat_brightness_history) > 1 else 0.0
-        z = (signal - avg) / (std + 1e-6)
+        # Do not override analyzer-provided z for audio source
+        if source != 'audio':
+            z = (signal - avg) / (std + 1e-6)
         # For audio: prefer novelty-based z scoring. During warmup (few samples), use mean/std on novelty history.
         if source == 'audio':
             try:
                 nov_hist = list(getattr(self, 'beat_audio_novelty_history', []))
-                if 3 <= len(nov_hist) < 15:
-                    n_avg = float(np.mean(nov_hist))
-                    n_std = float(np.std(nov_hist))
-                    z = (float(locals().get('novelty', 0.0)) - n_avg) / (n_std + 1e-6)
+                analyzer_present = hasattr(self, 'audio_beat_analyzer') and (self.audio_beat_analyzer is not None)
+                if (not analyzer_present) or len(nov_hist) < 3:
+                    if 3 <= len(nov_hist) < 15:
+                        n_avg = float(np.mean(nov_hist))
+                        n_std = float(np.std(nov_hist))
+                        z = (float(locals().get('novelty', 0.0)) - n_avg) / (n_std + 1e-6)
             except Exception:
                 pass
             # For audio source, compute robust statistics on novelty and its derivative when enough history exists
             try:
                 nov_hist = list(getattr(self, 'beat_audio_novelty_history', []))
-                if len(nov_hist) >= 15:
+                analyzer_present = hasattr(self, 'audio_beat_analyzer') and (self.audio_beat_analyzer is not None)
+                if (not analyzer_present) and len(nov_hist) >= 15:
                     med = float(np.median(nov_hist))
                     mad = float(np.median(np.abs(np.array(nov_hist) - med)))
                     robust_scale = (1.4826 * mad) + 1e-6
@@ -1672,11 +1708,8 @@ class ROITracker:
                     else:
                         dscale = robust_scale
                     z_deriv = float(novelty_deriv) / dscale
-                else:
-                    # Fallback to mean/std if not enough history
-                    z_deriv = 0.0
             except Exception:
-                z_deriv = 0.0
+                pass
 
         # Hysteresis + interval gating
         now_ms = frame_time_ms

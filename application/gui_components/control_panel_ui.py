@@ -736,6 +736,12 @@ class ControlPanelUI:
         imgui.spacing()
 
         if imgui.collapsing_header(
+            "Audio##SettingsMenuAudio",
+            flags=imgui.TREE_NODE_DEFAULT_OPEN,
+        )[0]:
+            self._render_settings_audio_playback()
+
+        if imgui.collapsing_header(
             "Interface & Performance##SettingsMenuPerfInterface",
             flags=imgui.TREE_NODE_DEFAULT_OPEN,
         )[0]:
@@ -778,6 +784,41 @@ class ControlPanelUI:
             if imgui.button("Cancel", width=pw):
                 imgui.close_current_popup()
             imgui.end_popup()
+
+    def _render_settings_audio_playback(self):
+        app = self.app
+        settings = app.app_settings
+        proc = getattr(app, 'processor', None)
+
+        # Enable/disable audio playback
+        enabled = bool(settings.get("audio_playback_enabled", True))
+        ch_enabled, new_enabled = imgui.checkbox("Enable Audio Playback##AudioEnable", enabled)
+        if ch_enabled and new_enabled != enabled:
+            settings.set("audio_playback_enabled", bool(new_enabled))
+            # If disabling while playing, stop audio immediately for consistency
+            if not new_enabled and proc and hasattr(proc, "_stop_audio_playback"):
+                try:
+                    proc._stop_audio_playback()
+                except Exception:
+                    pass
+        _tooltip_if_hovered("Master toggle for audio playback during preview/live tracking.")
+
+        # Volume slider (0-100)
+        imgui.push_item_width(220)
+        cur_vol = int(settings.get("audio_volume", 100) or 100)
+        cur_vol = max(0, min(100, cur_vol))
+        ch_vol, nv = imgui.slider_int("Volume##AudioVolume", cur_vol, 0, 100)
+        imgui.pop_item_width()
+        if ch_vol and nv != cur_vol:
+            settings.set("audio_volume", int(max(0, min(100, nv))))
+            # Apply live if SoundDevice+PyAV backend is active
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend and getattr(backend, "is_running", lambda: False)():
+                    backend.set_volume(float(nv) / 100.0)
+            except Exception:
+                pass
+        _tooltip_if_hovered("Adjust playback loudness. Live update when SoundDevice backend is active; with ffplay fallback, applies on next start.")
 
     def _render_post_processing_tab(self):
         app = self.app
