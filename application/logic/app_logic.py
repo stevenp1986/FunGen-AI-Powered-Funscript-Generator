@@ -122,7 +122,7 @@ class ApplicationLogic:
         status_log_config = {
             logging.INFO: 3.0, logging.WARNING: 6.0, logging.ERROR: 10.0, logging.CRITICAL: 15.0,
         }
-        self.app_log_file_path = 'fungen.log'  # Define app_log_file_path
+        self.app_log_file_path = 'logs/fungen.log'  # Define app_log_file_path
 
         # --- Start of Log Purge ---
         try:

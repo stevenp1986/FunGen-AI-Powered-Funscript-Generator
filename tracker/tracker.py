@@ -1556,6 +1556,10 @@ class ROITracker:
         audio_latency_ms_cfg = float(get("beat_audio_latency_ms", 0.0))  # compensate constant latency
         # Absolute novelty threshold override (envelope - EMA); helps detect clear short spikes
         novelty_abs_thr = float(get("beat_audio_abs_novelty_thr", 0.3))
+        # Strict audio gating mode to isolate metronome clicks only
+        audio_strict = bool(get("beat_audio_strict_mode", True))
+        # Optional: enforce a minimum inter-beat interval just for audio source (debounce)
+        audio_min_interval_ms = float(get("beat_audio_min_interval_ms", 0.0))
 
         # Clamp/sanitize amplitude inputs and handle swapped values
         amp_min = max(0, min(100, amp_min))
@@ -1567,6 +1571,13 @@ class ROITracker:
         if source == "metronome" and bpm > 0:
             beat_period_ms = (60000.0 / bpm) / subdivision
             min_interval_ms = max(min_interval_ms, 0.5 * beat_period_ms)
+
+        # If using audio as source, optionally strengthen the debounce interval
+        if source == "audio" and audio_min_interval_ms > 0.0:
+            try:
+                min_interval_ms = max(min_interval_ms, float(audio_min_interval_ms))
+            except Exception:
+                pass
 
         action_log_list: List[Dict] = []
 
@@ -1780,18 +1791,27 @@ class ROITracker:
                     deriv_ok = True
 
             # Trigger logic:
-            # - Primary: absolute novelty above threshold with interval gating (no derivative requirement).
-            # - Secondary: robust z + derivative + interval gating.
-            if getattr(self, 'beat_armed', True) and (
-                ((abs_nov >= max(0.0, novelty_abs_thr)) and interval_ok) or
-                ((z_ok and deriv_ok) and interval_ok)
-            ):
+            # - Strict mode: require all three (z, derivative, absolute novelty) + interval.
+            # - Default mode: allow either absolute novelty OR (z + derivative), both with interval gating.
+            if audio_strict:
+                trigger_condition = (z_ok and deriv_ok and (abs_nov >= max(0.0, novelty_abs_thr)) and interval_ok)
+            else:
+                trigger_condition = (
+                    ((abs_nov >= max(0.0, novelty_abs_thr)) and interval_ok) or
+                    ((z_ok and deriv_ok) and interval_ok)
+                )
+            if getattr(self, 'beat_armed', True) and trigger_condition:
                 triggered = True
                 self.beat_armed = False
                 self.beat_last_tick_time_ms = now_ms
             # Re-arm conditions: low novelty or z below low threshold
-            if not getattr(self, 'beat_armed', True) and (abs_nov <= max(0.0, novelty_abs_thr) * 0.5 or z <= local_thr_low):
-                self.beat_armed = True
+            if not getattr(self, 'beat_armed', True):
+                if audio_strict:
+                    if (abs_nov <= max(0.0, novelty_abs_thr) * 0.4) and (z <= local_thr_low):
+                        self.beat_armed = True
+                else:
+                    if (abs_nov <= max(0.0, novelty_abs_thr) * 0.5) or (z <= local_thr_low):
+                        self.beat_armed = True
             # Fail-safe: if not re-armed by hysteresis after a while, re-arm by time to allow next beat
             if not getattr(self, 'beat_armed', True):
                 last_ms_fs = self.beat_last_tick_time_ms if hasattr(self, 'beat_last_tick_time_ms') else None

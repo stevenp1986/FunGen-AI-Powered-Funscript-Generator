@@ -145,7 +145,7 @@ class AppSettings:
             "beat_amp_max": 90,
             "beat_waveform": "step",  # step | triangle | sine (future)
             # Visual detection thresholds
-            "beat_threshold_sigma": 2.0,      # peaks when z-score crosses this from below
+            "beat_threshold_sigma": 1.0,      # peaks when z-score crosses this from below (lowered from 2.0)
             "beat_hysteresis_ratio": 0.6,     # drop back below this fraction of threshold to re-arm
             "beat_min_interval_ms": 250,      # minimum time between beats
             # Musical timing adjustments
@@ -177,6 +177,10 @@ class AppSettings:
 
             # Auto Post-Processing
             "enable_auto_post_processing": False,
+
+            # --- Audio DSP EQ Options ---
+            # When enabled, use fixed ±200 Hz bandwidth by computing Q dynamically: Q = center_hz / 400
+            "audio_eq_fixed_bandwidth_enabled": False,
             
             # Database Management
             "retain_stage2_database": True,  # Keep SQLite database after processing (default: True for GUI, False for CLI)

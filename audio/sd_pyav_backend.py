@@ -29,6 +29,22 @@ class SoundDevicePyAVAudioBackend:
         self._vol = 1.0
         self._running = False
         self._cb_buf = None  # type: Optional[np.ndarray]
+        # Lightweight audio processing state
+        self._eq_enabled = True
+        self._eq_fs = 48000
+        self._eq_b = None  # type: Optional[np.ndarray]
+        self._eq_a = None  # type: Optional[np.ndarray]
+        self._eq_z1 = None  # type: Optional[np.ndarray]
+        self._eq_z2 = None  # type: Optional[np.ndarray]
+        self._eq_center_hz = 2000.0
+        self._eq_q = 3.0
+        self._eq_gain_db = 9.0
+        self._norm_enabled = True
+        self._norm_gain = 1.0
+        self._norm_target_peak = 0.90  # aim for -1 dBFS
+        self._norm_max_boost = 3.0     # cap normalization boost
+        self._norm_attack = 0.2        # how fast gain increases towards louder (slower = avoid pumping)
+        self._norm_release = 0.05      # how fast gain decreases when clipping risk (faster to prevent overs)
 
     @property
     def available(self) -> bool:
@@ -39,6 +55,63 @@ class SoundDevicePyAVAudioBackend:
 
     def is_running(self) -> bool:
         return self._running
+
+    # -------------------------
+    # Public configuration API
+    # -------------------------
+    def configure_eq(self, enabled: Optional[bool] = None,
+                     center_hz: Optional[float] = None,
+                     q: Optional[float] = None,
+                     gain_db: Optional[float] = None) -> None:
+        """Configure peaking EQ parameters. Safe to call anytime; takes effect on next start.
+        If called during playback, parameters are stored and will apply after restart."""
+        if enabled is not None:
+            self._eq_enabled = bool(enabled)
+        if center_hz is not None:
+            try:
+                self._eq_center_hz = float(center_hz)
+            except Exception:
+                pass
+        if q is not None:
+            try:
+                self._eq_q = max(0.1, float(q))
+            except Exception:
+                pass
+        if gain_db is not None:
+            try:
+                self._eq_gain_db = float(gain_db)
+            except Exception:
+                pass
+
+    def configure_normalizer(self, enabled: Optional[bool] = None,
+                             target_peak: Optional[float] = None,
+                             max_boost: Optional[float] = None,
+                             attack: Optional[float] = None,
+                             release: Optional[float] = None) -> None:
+        """Configure adaptive peak normalizer. Safe to call anytime; takes effect immediately for gain state.
+        """
+        if enabled is not None:
+            self._norm_enabled = bool(enabled)
+        if target_peak is not None:
+            try:
+                self._norm_target_peak = float(np.clip(target_peak, 0.1, 0.999))
+            except Exception:
+                pass
+        if max_boost is not None:
+            try:
+                self._norm_max_boost = float(max(1.0, max_boost))
+            except Exception:
+                pass
+        if attack is not None:
+            try:
+                self._norm_attack = float(np.clip(attack, 0.0, 1.0))
+            except Exception:
+                pass
+        if release is not None:
+            try:
+                self._norm_release = float(np.clip(release, 0.0, 1.0))
+            except Exception:
+                pass
 
     def stop(self) -> None:
         try:
@@ -102,6 +175,21 @@ class SoundDevicePyAVAudioBackend:
                 container.close()
                 return
 
+            # Configure a gentle peaking EQ around typical metronome click band (~2 kHz)
+            try:
+                self._eq_fs = int(target_rate)
+                # Peaking EQ parameters
+                f0 = float(self._eq_center_hz)   # center frequency (Hz)
+                Q = float(self._eq_q)            # quality factor (bandwidth)
+                gain_db = float(self._eq_gain_db) # boost amount
+                self._design_peaking_eq(f0, Q, gain_db)
+                # Reset filter state for 2 channels
+                self._eq_z1 = np.zeros(2, dtype=np.float32)
+                self._eq_z2 = np.zeros(2, dtype=np.float32)
+            except Exception:
+                # Disable EQ on any failure
+                self._eq_enabled = False
+
             def callback(outdata, frames, time_info, status):
                 if status.output_underflow:
                     # Fill with silence on underflow
@@ -119,9 +207,30 @@ class SoundDevicePyAVAudioBackend:
                         break
                     if nxt.dtype != np.float32:
                         nxt = nxt.astype(np.float32, copy=False)
+                    # Apply EQ boost around metronome band before volume
+                    if self._eq_enabled and self._eq_b is not None and self._eq_a is not None:
+                        try:
+                            nxt = self._apply_biquad_peaking(nxt)
+                        except Exception:
+                            pass
                     # Apply volume then hard-clip to avoid overdrive
                     if self._vol != 1.0:
                         nxt *= self._vol
+                    # Adaptive peak normalization/limiting towards -1 dBFS
+                    if self._norm_enabled:
+                        try:
+                            peak = float(np.max(np.abs(nxt))) if nxt.size else 0.0
+                            if peak > 0:
+                                desired = min(self._norm_max_boost, self._norm_target_peak / peak)
+                                # If desired < current gain -> reduce quickly (release)
+                                if desired < self._norm_gain:
+                                    alpha = self._norm_release
+                                else:
+                                    alpha = self._norm_attack
+                                self._norm_gain = (1.0 - alpha) * self._norm_gain + alpha * desired
+                                nxt *= self._norm_gain
+                        except Exception:
+                            pass
                     # Clip regardless, in case upstream amplitude exceeds 1.0
                     np.clip(nxt, -1.0, 1.0, out=nxt)
                     # Ensure channels match
@@ -268,3 +377,56 @@ class SoundDevicePyAVAudioBackend:
         except Exception as e:
             self.logger.warning(f"Audio backend start failed: {e}")
             self.stop()
+
+    # -------------------------
+    # Lightweight DSP helpers
+    # -------------------------
+    def _design_peaking_eq(self, f0: float, Q: float, gain_db: float) -> None:
+        """Design biquad peaking EQ coefficients and store in self._eq_b/self._eq_a.
+        Based on RBJ cookbook. Assumes fs in self._eq_fs. """
+        fs = float(max(1, self._eq_fs))
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * np.pi * (f0 / fs)
+        cos_w0 = np.cos(w0)
+        sin_w0 = np.sin(w0)
+        alpha = sin_w0 / (2.0 * Q)
+        b0 = 1.0 + alpha * A
+        b1 = -2.0 * cos_w0
+        b2 = 1.0 - alpha * A
+        a0 = 1.0 + alpha / A
+        a1 = -2.0 * cos_w0
+        a2 = 1.0 - alpha / A
+        # Normalize to a0 = 1
+        b = np.array([b0 / a0, b1 / a0, b2 / a0], dtype=np.float32)
+        a = np.array([1.0, a1 / a0, a2 / a0], dtype=np.float32)
+        self._eq_b = b
+        self._eq_a = a
+
+    def _apply_biquad_peaking(self, x: np.ndarray) -> np.ndarray:
+        """Apply the designed peaking EQ to a [samples, channels] float32 array.
+        Maintains simple per-channel direct form I state (z1, z2)."""
+        if x.ndim == 1:
+            x = x.reshape(-1, 1)
+        if self._eq_b is None or self._eq_a is None:
+            return x
+        b0, b1, b2 = float(self._eq_b[0]), float(self._eq_b[1]), float(self._eq_b[2])
+        a1, a2 = float(self._eq_a[1]), float(self._eq_a[2])
+        # Ensure state arrays exist and match channels
+        ch = x.shape[1]
+        if self._eq_z1 is None or self._eq_z2 is None or self._eq_z1.shape[0] != ch:
+            self._eq_z1 = np.zeros(ch, dtype=np.float32)
+            self._eq_z2 = np.zeros(ch, dtype=np.float32)
+        z1 = self._eq_z1
+        z2 = self._eq_z2
+        y = np.empty_like(x)
+        # Process sample-by-sample per channel (small blocks -> acceptable cost)
+        for n in range(x.shape[0]):
+            xn = x[n, :]
+            yn = b0 * xn + z1
+            z1 = b1 * xn - a1 * yn + z2
+            z2 = b2 * xn - a2 * yn
+            y[n, :] = yn
+        # Store updated state
+        self._eq_z1 = z1
+        self._eq_z2 = z2
+        return y

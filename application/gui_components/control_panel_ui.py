@@ -820,6 +820,143 @@ class ControlPanelUI:
                 pass
         _tooltip_if_hovered("Adjust playback loudness. Live update when SoundDevice backend is active; with ffplay fallback, applies on next start.")
 
+        # --- Audio DSP Controls ---
+        imgui.spacing()
+        imgui.separator()
+
+        # EQ Controls
+        imgui.text("EQ (Peaking)")
+        eq_enabled = bool(settings.get("audio_eq_enabled", True))
+        ch_eq_en, nv_eq_en = imgui.checkbox("Enable EQ##AudioEQEnable", eq_enabled)
+        if ch_eq_en and nv_eq_en != eq_enabled:
+            settings.set("audio_eq_enabled", bool(nv_eq_en))
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend:
+                    backend.configure_eq(enabled=bool(nv_eq_en))
+            except Exception:
+                pass
+        _tooltip_if_hovered("Enable a narrow-band peaking EQ to enhance metronome clicks. Changes to frequency/Q/gain apply on next playback start.")
+
+        # EQ parameters
+        eq_center = float(settings.get("audio_eq_center_hz", 2000.0))
+        eq_q = float(settings.get("audio_eq_q", 3.0))
+        eq_gain = float(settings.get("audio_eq_gain_db", 9.0))
+        fixed_bw = bool(settings.get("audio_eq_fixed_bandwidth_enabled", False))
+
+        # Fixed bandwidth toggle (±200 Hz => Q = center/400)
+        ch_fix, nv_fix = imgui.checkbox("Fixed ±200 Hz bandwidth##AudioEQFixedBW", fixed_bw)
+        if ch_fix and nv_fix != fixed_bw:
+            settings.set("audio_eq_fixed_bandwidth_enabled", bool(nv_fix))
+            # If enabling, compute and store/apply dynamic Q immediately
+            if nv_fix:
+                dyn_q = max(0.1, float(eq_center) / 400.0)
+                if abs(dyn_q - eq_q) > 1e-6:
+                    settings.set("audio_eq_q", float(dyn_q))
+                    try:
+                        backend = getattr(proc, "_audio_backend", None) if proc else None
+                        if backend:
+                            backend.configure_eq(q=float(dyn_q))
+                    except Exception:
+                        pass
+        _tooltip_if_hovered("When enabled, bandwidth is fixed at ±200 Hz and Q is computed as center/400. Disables the Q slider.")
+
+        imgui.push_item_width(220)
+        with _DisabledScope(not eq_enabled):
+            ch_f0, nv_f0 = imgui.slider_float("Center (Hz)##AudioEQCenter", eq_center, 1000.0, 5000.0, format="%.0f")
+            # Disable Q only when fixed bandwidth is enabled
+            with _DisabledScope(fixed_bw):
+                ch_q, nv_q = imgui.slider_float("Q Factor##AudioEQQ", eq_q, 0.1, 10.0, format="%.2f")
+            ch_g, nv_g = imgui.slider_float("Gain (dB)##AudioEQGain", eq_gain, -20.0, 20.0, format="%.1f")
+        imgui.pop_item_width()
+        if eq_enabled and ch_f0 and nv_f0 != eq_center:
+            settings.set("audio_eq_center_hz", float(nv_f0))
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend:
+                    backend.configure_eq(center_hz=float(nv_f0))
+                    # If fixed bandwidth, recompute and apply Q live
+                    if fixed_bw:
+                        dyn_q = max(0.1, float(nv_f0) / 400.0)
+                        settings.set("audio_eq_q", float(dyn_q))
+                        backend.configure_eq(q=float(dyn_q))
+            except Exception:
+                pass
+        if eq_enabled and not fixed_bw and ch_q and nv_q != eq_q:
+            settings.set("audio_eq_q", float(nv_q))
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend:
+                    backend.configure_eq(q=float(nv_q))
+            except Exception:
+                pass
+        if eq_enabled and ch_g and nv_g != eq_gain:
+            settings.set("audio_eq_gain_db", float(nv_g))
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend:
+                    backend.configure_eq(gain_db=float(nv_g))
+            except Exception:
+                pass
+        _tooltip_if_hovered("Center 1-5 kHz, Q 0.1-10 controls bandwidth (disabled in fixed mode), Gain -20 to +20 dB. Filter redesigns on next playback start.")
+
+        imgui.spacing()
+        imgui.separator()
+
+        # Adaptive Normalization Controls
+        imgui.text("Adaptive Normalization")
+        norm_enabled = bool(settings.get("audio_normalizer_enabled", True))
+        ch_ne, nv_ne = imgui.checkbox("Enable Normalizer##AudioNormEnable", norm_enabled)
+        if ch_ne and nv_ne != norm_enabled:
+            settings.set("audio_normalizer_enabled", bool(nv_ne))
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend and getattr(backend, "is_running", lambda: False)():
+                    backend.configure_normalizer(enabled=bool(nv_ne))
+            except Exception:
+                pass
+        _tooltip_if_hovered("Adaptive peak normalization to maintain consistent loudness and prevent clipping. Applies live during playback.")
+
+        norm_target = float(settings.get("audio_norm_target_peak", 0.90))
+        norm_max_boost = float(settings.get("audio_norm_max_boost", 3.0))
+        norm_attack = float(settings.get("audio_norm_attack", 0.2))
+        norm_release = float(settings.get("audio_norm_release", 0.05))
+        imgui.push_item_width(220)
+        with _DisabledScope(not norm_enabled):
+            ch_tp, nv_tp = imgui.slider_float("Target Peak##AudioNormTarget", norm_target, 0.10, 1.00, format="%.2f")
+            ch_mb, nv_mb = imgui.slider_float("Max Boost##AudioNormMaxBoost", norm_max_boost, 1.0, 10.0, format="%.1f")
+            ch_at, nv_at = imgui.slider_float("Attack (s)##AudioNormAttack", norm_attack, 0.01, 1.00, format="%.2f")
+            ch_rl, nv_rl = imgui.slider_float("Release (s)##AudioNormRelease", norm_release, 0.01, 1.00, format="%.2f")
+        imgui.pop_item_width()
+
+        # Apply and persist normalizer params with live update when backend is running
+        def _apply_norm_live(tp=None, mb=None, at=None, rl=None):
+            try:
+                backend = getattr(proc, "_audio_backend", None) if proc else None
+                if backend and getattr(backend, "is_running", lambda: False)():
+                    backend.configure_normalizer(
+                        target_peak=tp if tp is not None else None,
+                        max_boost=mb if mb is not None else None,
+                        attack=at if at is not None else None,
+                        release=rl if rl is not None else None,
+                    )
+            except Exception:
+                pass
+
+        if norm_enabled and ch_tp and nv_tp != norm_target:
+            settings.set("audio_norm_target_peak", float(nv_tp))
+            _apply_norm_live(tp=float(nv_tp))
+        if norm_enabled and ch_mb and nv_mb != norm_max_boost:
+            settings.set("audio_norm_max_boost", float(nv_mb))
+            _apply_norm_live(mb=float(nv_mb))
+        if norm_enabled and ch_at and nv_at != norm_attack:
+            settings.set("audio_norm_attack", float(nv_at))
+            _apply_norm_live(at=float(nv_at))
+        if norm_enabled and ch_rl and nv_rl != norm_release:
+            settings.set("audio_norm_release", float(nv_rl))
+            _apply_norm_live(rl=float(nv_rl))
+        _tooltip_if_hovered("Target peak (0.1-1.0), max boost (1-10x), attack/release time constants (s). Live-updated while playing.")
+
     def _render_post_processing_tab(self):
         app = self.app
         if imgui.collapsing_header(

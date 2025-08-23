@@ -1408,6 +1408,34 @@ class VideoProcessor:
                     self._audio_last_start_wallclock = None
                 return
 
+            # Configure backend DSP from app settings (if available)
+            # Settings getter
+            get = (self.app.app_settings.get if self.app and hasattr(self.app, 'app_settings') else (lambda k, d=None: d))
+            # EQ
+            eq_enabled = bool(get('audio_eq_enabled', True))
+            eq_center = float(get('audio_eq_center_hz', 2000.0))
+            eq_q = float(get('audio_eq_q', 3.0))
+            eq_gain = float(get('audio_eq_gain_db', 9.0))
+            # Apply fixed bandwidth mode (±200 Hz) if enabled: Q = center/400
+            fixed_bw_enabled = bool(get('audio_eq_fixed_bandwidth_enabled', False))
+            eq_q_effective = (max(0.1, float(eq_center) / 400.0) if fixed_bw_enabled else float(eq_q))
+            if hasattr(backend, 'configure_eq'):
+                backend.configure_eq(enabled=eq_enabled, center_hz=eq_center, q=eq_q_effective, gain_db=eq_gain)
+            # Normalizer
+            norm_enabled = bool(get('audio_normalizer_enabled', True))
+            norm_target = float(get('audio_norm_target_peak', 0.90))
+            norm_max_boost = float(get('audio_norm_max_boost', 3.0))
+            norm_attack = float(get('audio_norm_attack', 0.2))
+            norm_release = float(get('audio_norm_release', 0.05))
+            if hasattr(backend, 'configure_normalizer'):
+                backend.configure_normalizer(enabled=norm_enabled, target_peak=norm_target,
+                                             max_boost=norm_max_boost, attack=norm_attack, release=norm_release)
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(f"[AUDIO] EQ: enabled={eq_enabled}, f0={eq_center} Hz, Q={eq_q_effective}"
+                                 f"{' (fixed ±200 Hz)' if fixed_bw_enabled else ''}, gain={eq_gain} dB | "
+                                 f"Normalizer: enabled={norm_enabled}, target={norm_target}, max_boost={norm_max_boost}, "
+                                 f"attack={norm_attack}, release={norm_release}")
+
             backend.set_volume(vol_setting / 100.0)
             # Orange (WARNING) log to clearly indicate module in use
             if not getattr(self, '_audio_logged_once', False):
