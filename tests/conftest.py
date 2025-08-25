@@ -10,6 +10,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gui: marks tests that require GUI interaction")
     config.addinivalue_line("markers", "cli: marks tests for CLI functionality")
     config.addinivalue_line("markers", "ui_state: marks tests for UI state management")
+    config.addinivalue_line("markers", "smoke: marks tests as smoke tests")
 
 
 def pytest_addoption(parser):
