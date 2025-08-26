@@ -234,10 +234,12 @@ class AppFileManager:
             return
 
         # --- Backup logic before saving ---
-        base, _ = os.path.splitext(self.video_path)
-        path_next_to_vid = f"{base}.funscript"
+        base, _ = os.path.splitext(filepath)
+        if base.endswith(".roll"):
+            base = base[:-5]
+        path_next_to_vid, _ = os.path.splitext(self.video_path)
         if os.path.exists(filepath):
-            if not filepath == path_next_to_vid:
+            if not base == path_next_to_vid:
                 try:
                     check_write_access(filepath)
                     # Create a unique backup filename with a Unix timestamp

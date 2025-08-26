@@ -1979,6 +1979,64 @@ class ROITracker:
 
         return processed_frame, action_log_list if action_log_list else None
 
+    def set_dot_initial_point(self, x_abs: int, y_abs: int, frame: Optional[np.ndarray] = None) -> None:
+        """Set the initial dot point by user click.
+        Expects coordinates in the processed frame space (after preprocess_frame letterboxing).
+        If a raw frame is provided, the method will preprocess it for consistent sampling.
+        Stores the selected column (x) and samples HSV at a small patch to drive adaptive masking.
+        """
+        try:
+            if frame is not None and frame.size > 0:
+                proc = self.preprocess_frame(frame)
+            else:
+                # If no frame, we cannot sample HSV; we can still lock x
+                proc = None
+            self.dot_selected_x = int(x_abs)
+            if proc is not None:
+                ph, pw = proc.shape[:2]
+                x = int(np.clip(x_abs, 0, pw - 1))
+                y = int(np.clip(y_abs, 0, ph - 1))
+                hsv = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
+                # Sample a small 5x5 neighborhood median to be robust
+                x1 = max(0, x - 2); x2 = min(pw - 1, x + 2)
+                y1 = max(0, y - 2); y2 = min(ph - 1, y + 2)
+                patch = hsv[y1:y2 + 1, x1:x2 + 1]
+                if patch.size > 0:
+                    sh = int(np.median(patch[..., 0]))
+                    ss = int(np.median(patch[..., 1]))
+                    sv = int(np.median(patch[..., 2]))
+                    self.dot_hsv_sample = (sh, ss, sv)
+                else:
+                    self.dot_hsv_sample = None
+            # Reset smoothing so the tracker settles quickly on the new point
+            self.dot_smoothed_xy = None
+            self.dot_last_detected_xy = None
+            self.logger.info(f"Dot initial point set at x={self.dot_selected_x}, hsv_sample={self.dot_hsv_sample}")
+        except Exception as e:
+            self.logger.error(f"Failed to set dot initial point: {e}")
+
+    def set_dot_boundary(self, rect_abs: Optional[Tuple[int, int, int, int]]) -> None:
+        """Set or clear the dot detection boundary rectangle in processed-frame coordinates.
+        Pass None to clear. Rect is (x, y, w, h). Values will be clamped to current target size lazily at use time.
+        """
+        self.dot_boundary_rect = rect_abs
+        if rect_abs is None:
+            self.logger.info("Dot boundary cleared.")
+        else:
+            x, y, w, h = rect_abs
+            self.logger.info(f"Dot boundary set to (x={x}, y={y}, w={w}, h={h}).")
+
+    def set_dot_boundary_and_point(self, rect_abs: Tuple[int, int, int, int], point_abs: Tuple[int, int], frame: Optional[np.ndarray]) -> None:
+        """Convenience: set boundary and initial dot point together.
+        Expects processed-frame coordinates for both.
+        """
+        try:
+            self.set_dot_boundary(rect_abs)
+            if point_abs is not None:
+                self.set_dot_initial_point(point_abs[0], point_abs[1], frame)
+        except Exception as e:
+            self.logger.error(f"Failed to set dot boundary and point: {e}")
+    
     def process_frame_for_dot_tracker(self, frame: np.ndarray, frame_time_ms: int, frame_index: Optional[int] = None) -> Tuple[np.ndarray, Optional[List[Dict]]]:
         """Detect and track a bright dot and output normalized positions.
         - Uses HSV thresholding for bright dot isolation

@@ -211,39 +211,12 @@ class VideoProcessor:
                 self.logger.warning(f"Unknown VR input format '{input_format}'. Not changed. Valid: {valid_formats}")
 
     def is_vr_active_or_potential(self) -> bool:
-        """
-        Returns True if VR mode is active or likely for the current video.
-
-        Used by the UI to decide whether to show VR-related controls. Criteria:
-        - Explicit setting to 'VR' OR
-        - Determined type is VR OR
-        - Heuristics indicate SBS/TB layout or filename keywords
-        """
-        try:
-            # If the user explicitly selected VR, always True
-            if self.video_type_setting == 'VR':
+        if self.video_type_setting == 'VR':
+            return True
+        if self.video_type_setting == 'auto':
+            if self.video_info and self.determined_video_type == 'VR':
                 return True
-
-            # If we've already determined VR from parameters, True
-            if self.determined_video_type == 'VR':
-                return True
-
-            # Without video info we can't infer reliably
-            if not self.video_info:
-                return False
-
-            width = self.video_info.get('width', 0)
-            height = self.video_info.get('height', 0)
-            is_sbs_resolution = width > 1000 and 1.8 * height <= width <= 2.2 * height
-            is_tb_resolution = height > 1000 and 1.8 * width <= height <= 2.2 * width
-            if is_sbs_resolution or is_tb_resolution:
-                return True
-
-            upper_path = (self.video_path or "").upper()
-            vr_keywords = ['VR', '_180', '_360', 'SBS', '_TB', 'FISHEYE', 'EQUIRECTANGULAR', 'LR_', 'OCULUS', '_3DH', 'MKX200']
-            return any(kw in upper_path for kw in vr_keywords)
-        except Exception:
-            return False
+        return False
 
     def set_tracker_processing_enabled(self, enable: bool):
         if enable and self.tracker is None:
@@ -929,6 +902,8 @@ class VideoProcessor:
         return float(self._audio_envelope[idx])
 
     def _is_10bit_cuda_pipe_needed(self) -> bool:
+        # TODO: Add bitshift processing for 10-bit videos (fast 10-bit to 8-bit conversion).
+        # Optional: Scale to 640x640 on GPU using tensorrt. This will not use lanczos. So if Lanczos is absolutely necessary, you will have to use other solution.
         """Checks if the special 2-pipe FFmpeg command for 10-bit CUDA should be used."""
         if not self.video_info:
             return False
@@ -1096,6 +1071,13 @@ class VideoProcessor:
                 self.logger.debug(f"{process_name} process did not terminate in time. Killing.")
                 process.kill()
                 self.logger.debug(f"{process_name} process killed.")
+         # Ensure all standard pipes are closed to release OS resources
+        for stream in (getattr(process, 'stdout', None), getattr(process, 'stderr', None), getattr(process, 'stdin', None)):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
     def _terminate_ffmpeg_processes(self):
         """Safely terminates all active FFmpeg processes using the helper."""
@@ -1783,6 +1765,77 @@ class VideoProcessor:
             self.is_processing = False
             self.pause_event.set()
             self.last_processed_chapter_id = None
+    
+    def _start_ffmpeg_for_segment_streaming(self, start_frame_abs_idx: int, num_frames_to_stream_hint: Optional[int] = None) -> bool:
+        self._terminate_ffmpeg_processes()
+
+        if not self.video_path or not self.video_info or self.video_info.get('fps', 0) <= 0:
+            self.logger.warning("Cannot start FFmpeg for segment: no video/invalid FPS.")
+            return False
+
+        start_time_seconds = start_frame_abs_idx / self.video_info['fps']
+        common_ffmpeg_prefix = ['ffmpeg', '-hide_banner', '-nostats', '-loglevel', 'error']
+
+        if self._is_10bit_cuda_pipe_needed():
+            self.logger.info("Using 2-pipe FFmpeg command for 10-bit CUDA segment streaming.")
+            video_height_for_crop = self.video_info.get('height', 0)
+            if video_height_for_crop <= 0:
+                self.logger.error("Cannot construct 10-bit CUDA pipe 1 for segment: video height is unknown.")
+                return False
+
+            pipe1_vf = f"crop={int(video_height_for_crop)}:{int(video_height_for_crop)}:0:0,scale_cuda=1000:1000"
+            cmd1 = common_ffmpeg_prefix[:]
+            cmd1.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
+            if start_time_seconds > 0.001: cmd1.extend(['-ss', str(start_time_seconds)])
+            cmd1.extend(['-i', self._active_video_source_path, '-an', '-sn', '-vf', pipe1_vf])
+            if num_frames_to_stream_hint and num_frames_to_stream_hint > 0:
+                cmd1.extend(['-frames:v', str(num_frames_to_stream_hint)])
+            cmd1.extend(['-c:v', 'hevc_nvenc', '-preset', 'fast', '-qp', '0', '-f', 'matroska', 'pipe:1'])
+
+            cmd2 = common_ffmpeg_prefix[:]
+            cmd2.extend(['-hwaccel', 'cuda', '-i', 'pipe:0', '-an', '-sn'])
+            effective_vf_pipe2 = self.ffmpeg_filter_string or f"scale={self.yolo_input_size}:{self.yolo_input_size}"
+            cmd2.extend(['-vf', effective_vf_pipe2])
+            if num_frames_to_stream_hint and num_frames_to_stream_hint > 0:
+                cmd2.extend(['-frames:v', str(num_frames_to_stream_hint)])
+            cmd2.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
+
+            self.logger.info(f"Segment Pipe 1 CMD: {' '.join(shlex.quote(str(x)) for x in cmd1)}")
+            self.logger.info(f"Segment Pipe 2 CMD: {' '.join(shlex.quote(str(x)) for x in cmd2)}")
+            try:
+                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                self.ffmpeg_pipe1_process = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creation_flags)
+                if self.ffmpeg_pipe1_process.stdout is None:
+                    raise IOError("Segment Pipe 1 stdout is None.")
+                self.ffmpeg_process = subprocess.Popen(cmd2, stdin=self.ffmpeg_pipe1_process.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_size_bytes * 20, creationflags=creation_flags)
+                self.ffmpeg_pipe1_process.stdout.close()
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to start 2-pipe FFmpeg for segment: {e}", exc_info=True)
+                self._terminate_ffmpeg_processes()
+                return False
+        else:
+            # Standard single FFmpeg process for 8-bit or non-CUDA accelerated video
+            hwaccel_cmd_list = self._get_ffmpeg_hwaccel_args()
+            ffmpeg_input_options = hwaccel_cmd_list[:]
+            if start_time_seconds > 0.001: ffmpeg_input_options.extend(['-ss', str(start_time_seconds)])
+            ffmpeg_cmd = common_ffmpeg_prefix + ffmpeg_input_options + ['-i', self._active_video_source_path, '-an', '-sn']
+            effective_vf = self.ffmpeg_filter_string or f"scale={self.yolo_input_size}:{self.yolo_input_size}"
+            ffmpeg_cmd.extend(['-vf', effective_vf])
+
+            if num_frames_to_stream_hint and num_frames_to_stream_hint > 0:
+                ffmpeg_cmd.extend(['-frames:v', str(num_frames_to_stream_hint)])
+
+            ffmpeg_cmd.extend(['-pix_fmt', 'bgr24', '-f', 'rawvideo', 'pipe:1'])
+            self.logger.info(f"Segment CMD (single pipe): {' '.join(shlex.quote(str(x)) for x in ffmpeg_cmd)}")
+            try:
+                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                self.ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_size_bytes * 20, creationflags=creation_flags)
+                return True
+            except Exception as e:
+                self.logger.warning(f"Failed to start FFmpeg for segment: {e}", exc_info=True)
+                self.ffmpeg_process = None
+                return False
         
         
     def stream_frames_for_segment(self, start_frame_abs_idx: int, num_frames_to_read: int, stop_event: Optional[threading.Event] = None) -> Iterator[Tuple[int, np.ndarray]]:

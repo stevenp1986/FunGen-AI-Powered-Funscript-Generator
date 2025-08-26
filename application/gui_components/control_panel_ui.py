@@ -358,8 +358,8 @@ class ControlPanelUI:
             tracker_mode.OSCILLATION_DETECTOR_LEGACY,
             tracker_mode.LIVE_YOLO_ROI,
             tracker_mode.LIVE_USER_ROI,
-            getattr(tracker_mode, 'DOT_TRACKER', None),
-            getattr(tracker_mode, 'BEAT_MARKER', None),
+            tracker_mode.DOT_TRACKER,
+            tracker_mode.BEAT_MARKER,
             tracker_mode.OFFLINE_2_STAGE,
             tracker_mode.OFFLINE_3_STAGE,
             tracker_mode.OFFLINE_3_STAGE_MIXED,
@@ -414,7 +414,8 @@ class ControlPanelUI:
                         tracker_mode.OSCILLATION_DETECTOR_LEGACY,
                         tracker_mode.LIVE_YOLO_ROI,
                         tracker_mode.LIVE_USER_ROI,
-                        getattr(tracker_mode, 'DOT_TRACKER', None),
+                        tracker_mode.DOT_TRACKER,
+                        tracker_mode.BEAT_MARKER,
                         tracker_mode.OFFLINE_2_STAGE,
                         tracker_mode.OFFLINE_3_STAGE,
                         tracker_mode.OFFLINE_3_STAGE_MIXED,
@@ -433,9 +434,9 @@ class ControlPanelUI:
                         tr.set_tracking_mode("OSCILLATION_DETECTOR")
                     elif new_mode == tracker_mode.OSCILLATION_DETECTOR_LEGACY:
                         tr.set_tracking_mode("OSCILLATION_DETECTOR_LEGACY")
-                    elif getattr(tracker_mode, 'DOT_TRACKER', None) and new_mode == tracker_mode.DOT_TRACKER:
+                    elif new_mode == tracker_mode.DOT_TRACKER:
                         tr.set_tracking_mode("DOT_TRACKER")
-                    elif getattr(tracker_mode, 'BEAT_MARKER', None) and new_mode == tracker_mode.BEAT_MARKER:
+                    elif new_mode == tracker_mode.BEAT_MARKER:
                         tr.set_tracking_mode("BEAT_MARKER")
                     else:
                         tr.set_tracking_mode("YOLO_ROI")
@@ -1361,15 +1362,17 @@ class ControlPanelUI:
         if mode in (self.TrackerMode.LIVE_YOLO_ROI, self.TrackerMode.LIVE_USER_ROI, self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY, getattr(self.TrackerMode, 'DOT_TRACKER', None), getattr(self.TrackerMode, 'BEAT_MARKER', None)):
             tr = app.tracker
             imgui.text(">> Tracker Status")
+            imgui.separator()
+            fps = (tr.current_fps if tr else 0.0)
+            imgui.text(" - Actual FPS: %.1f" % (fps if isinstance(fps, (int, float)) else 0.0))
+            roi_status = "Not Set"
             if tr:
-                roi_status = "Not Set"
                 if mode == self.TrackerMode.LIVE_YOLO_ROI:
-                    if getattr(tr, "current_roi", None) is not None:
-                        roi_status = (
-                            "Locked" if getattr(tr, "roi_locked", False)
-                            else "Tracking" if getattr(tr, "roi_tracking_active", False)
-                            else "Searching..."
-                        )
+                    roi_status = (
+                        "Tracking '%s'" % tr.main_interaction_class
+                        if getattr(tr, "main_interaction_class", None)
+                        else "Searching..."
+                    )
                 elif mode == self.TrackerMode.LIVE_USER_ROI:
                     roi_status = "Set" if getattr(tr, "user_roi_fixed", False) else "Not Set"
                 elif mode in [self.TrackerMode.OSCILLATION_DETECTOR, self.TrackerMode.OSCILLATION_DETECTOR_LEGACY]:
@@ -1398,6 +1401,12 @@ class ControlPanelUI:
                     # For visual source, reuse the User ROI controls (Set/Clear)
                     if source == "visual":
                         self._render_user_roi_controls_for_run_tab()
+                imgui.text(" - ROI Status: %s" % roi_status)
+                if mode == self.TrackerMode.LIVE_USER_ROI:
+                    self._render_user_roi_controls_for_run_tab()
+                elif mode == self.TrackerMode.DOT_TRACKER:
+                    self._render_dot_tracker_controls_for_run_tab()
+                return
     def _render_dot_tracker_controls_for_run_tab(self):
         app = self.app
         sp = app.stage_processor
@@ -1889,7 +1898,7 @@ class ControlPanelUI:
             if old_mode != self.app.tracking_axis_mode:
                 self.app.project_manager.project_dirty = True
                 self.app.logger.info(f"Tracking axis mode set to: {self.app.tracking_axis_mode}", extra={'status_message': True})
-                self.app.app_settings.set("tracking_axis_mode", self.app.tracking_axis_mode)  # Auto-save
+                self.app.app_settings.set("tracking_axis_mode", self.app.tracking_axis_mode) # Auto-save
                 self.app.energy_saver.reset_activity_timer()
 
         # Omni smoothing slider (only when Omni mode is selected)
@@ -1924,7 +1933,7 @@ class ControlPanelUI:
                 if old_target != self.app.single_axis_output_target:
                     self.app.project_manager.project_dirty = True
                     self.app.logger.info(f"Single axis output target set to: {self.app.single_axis_output_target}", extra={'status_message': True})
-                    self.app.app_settings.set("single_axis_output_target", self.app.single_axis_output_target)  # Auto-save
+                    self.app.app_settings.set("single_axis_output_target", self.app.single_axis_output_target) # Auto-save
                     self.app.energy_saver.reset_activity_timer()
         if disable_axis_controls:
             imgui.pop_style_var()

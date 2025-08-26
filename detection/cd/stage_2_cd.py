@@ -1443,7 +1443,7 @@ def pass_4_assign_positions_and_segments(app, frames: List, segments: List, vide
     # This ensures the chapter bar displays correctly based on final segments
     _update_frames_with_aggregated_positions(frames, segments, logger)
 
-def pass_5_recalculate_heights_post_aggregation(app, frames: List, segments: List, video_info: Dict, vr_vertical_third_filter: bool, logger: Optional[logging.Logger]):
+def pass_5_recalculate_heights_post_aggregation(app, frames: List, segments: List, video_info: Dict, vr_vertical_third_filter: bool, yolo_input_size: int, logger: Optional[logging.Logger]):
     """
     Recalculates max_height for the penis based on the final, aggregated chapter segments.
     This ensures height is consistent across a logical action, fixing the "drop to zero" issue.
@@ -2468,8 +2468,8 @@ def perform_contact_analysis(
         ("Step 10: Simplify Signal", pass_8_simplify_signal)
     ]
     main_steps_list = main_steps_list_base
-    # if generate_funscript_actions_arg:
-    #     main_steps_list.extend(main_steps_list_funscript_gen)
+    if generate_funscript_actions_arg:
+        main_steps_list.extend(main_steps_list_funscript_gen)
 
     num_main_steps = len(main_steps_list)
 
@@ -2497,7 +2497,7 @@ def perform_contact_analysis(
         elif step_func == pass_4_assign_positions_and_segments:
             step_func(app, frame_objects, segments, video_info_dict, yolo_input_size_arg, logger)
         elif step_func == pass_5_recalculate_heights_post_aggregation:
-            step_func(app, frame_objects, segments, video_info_dict, vr_vertical_third_filter_arg, logger)
+            step_func(app, frame_objects, segments, video_info_dict, vr_vertical_third_filter_arg, yolo_input_size_arg, logger)
         elif step_func == pass_6_determine_distance:
             step_func(app, frame_objects, segments, video_info_dict, yolo_input_size_arg, logger)
         elif step_func == pass_7_smooth_and_normalize_distances:

@@ -525,8 +525,8 @@ class VideoDisplayUI:
 
                             # Visualization of active Oscillation Area (ROI outline)
                             # Initialize optional overlay anchors to avoid UnboundLocalError
-                            area_start_screen = None
-                            area_end_screen = None
+                            #area_start_screen = None
+                            #area_end_screen = None
 
                             # Rule: If ROI toggle is ON => always show. If ROI toggle is OFF => show only when not actively tracking (paused/stopped).
                             if self.app.tracker and self.app.tracker.oscillation_area_fixed is not None and not self.app.is_setting_oscillation_area_mode:
@@ -541,7 +541,10 @@ class VideoDisplayUI:
                                     ax_vid, ay_vid, aw_vid, ah_vid = tracker.oscillation_area_fixed
                                     area_start_screen = self._video_to_screen_coords(ax_vid, ay_vid)
                                     area_end_screen = self._video_to_screen_coords(ax_vid + aw_vid, ay_vid + ah_vid)
-                            
+                                    if area_start_screen and area_end_screen:
+                                        draw_list.add_rect(area_start_screen[0], area_start_screen[1], area_end_screen[0], area_end_screen[1], imgui.get_color_u32_rgba(0, 128, 255, 255), thickness=2)
+                                        draw_list.add_text(area_start_screen[0], area_start_screen[1] - 15, imgui.get_color_u32_rgba(0, 255, 255, 255), "Oscillation Area")
+                                
                             # --- Dot Pick Boundary Draw + Click Logic (for DOT_TRACKER) ---
                             if getattr(self.app, 'is_setting_dot_pick_mode', False):
                                 draw_list = imgui.get_window_draw_list()
@@ -638,10 +641,7 @@ class VideoDisplayUI:
                                                 else:
                                                     self.app.logger.info("Clicked point is outside the boundary. Please click inside.", extra={'status_message': True})
 
-                                # Also render oscillation outline if present (non-interfering)
-                                if area_start_screen and area_end_screen:
-                                    draw_list.add_rect(area_start_screen[0], area_start_screen[1], area_end_screen[0], area_end_screen[1], imgui.get_color_u32_rgba(0, 128, 255, 255), thickness=2)
-                                    draw_list.add_text(area_start_screen[0], area_start_screen[1] - 15, imgui.get_color_u32_rgba(0, 255, 255, 255), "Oscillation Area")
+                                
 
                             # Visualization of active User Fixed ROI (even when not setting)
                             if self.app.tracker and self.app.tracker.tracking_mode == "USER_FIXED_ROI" and \
