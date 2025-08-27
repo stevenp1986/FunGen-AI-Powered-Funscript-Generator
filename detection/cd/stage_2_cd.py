@@ -2468,8 +2468,8 @@ def perform_contact_analysis(
         ("Step 10: Simplify Signal", pass_8_simplify_signal)
     ]
     main_steps_list = main_steps_list_base
-    if generate_funscript_actions_arg:
-        main_steps_list.extend(main_steps_list_funscript_gen)
+    #if generate_funscript_actions_arg:
+    #   main_steps_list.extend(main_steps_list_funscript_gen)
 
     num_main_steps = len(main_steps_list)
 
@@ -2614,27 +2614,43 @@ def perform_contact_analysis(
     secondary_actions_final = []
     
     if generate_funscript_actions_arg:
+        logger.info(f"Funscript generation enabled. final_funscript_frames length: {len(final_funscript_frames) if final_funscript_frames else 0}")
         current_video_fps = video_info_dict.get('fps', 0)
         if current_video_fps > 0 and final_funscript_frames:
+            logger.info(f"Creating funscript with {len(final_funscript_frames)} frames, FPS: {current_video_fps}")
             # Create DualAxisFunscript object
             funscript_obj = DualAxisFunscript(logger=logger)
-            
-            # Add actions to the funscript object
-            for fid, pos_primary, pos_secondary in zip(final_funscript_frames, final_funscript_distances,
-                                                       final_funscript_distances_lr):
-                if stop_event.is_set(): break
-                timestamp_ms = int(round((fid / current_video_fps) * 1000))
-                funscript_obj.add_action(timestamp_ms, int(pos_primary), int(pos_secondary))
-            
+
+            # Pre-compute timestamps in bulk using NumPy for better performance
+            if stop_event.is_set():
+                return None
+    
+            # Pre-compute all timestamps at once
+            timestamps_ms = (np.array(final_funscript_frames, dtype=np.float64) / current_video_fps * 1000).astype(np.int64)
+
+            # Convert positions to integers in bulk
+            primary_positions = np.array(final_funscript_distances, dtype=np.int32)
+            secondary_positions = np.array(final_funscript_distances_lr, dtype=np.int32)
+
+            # Add all actions at once using extend for better performance
+            funscript_obj.primary_actions = [
+                {"at": int(ts), "pos": int(pos)} 
+                for ts, pos in zip(timestamps_ms, primary_positions)
+            ]
+            funscript_obj.secondary_actions = [
+                {"at": int(ts), "pos": int(pos)} 
+                for ts, pos in zip(timestamps_ms, secondary_positions)
+            ]
+
+            # Sort actions by timestamp
+            funscript_obj.primary_actions.sort(key=lambda x: x["at"])
+            funscript_obj.secondary_actions.sort(key=lambda x: x["at"])
+
+            # Invalidate caches since we modified actions directly
+            funscript_obj._invalidate_cache('both')
+
             # log the final video segments
             logger.info(f"Final video segments: {final_video_segments}")
-
-            # Set chapters from video segments
-            if final_video_segments and not stop_event.is_set():
-                funscript_obj.set_chapters_from_segments(final_video_segments, current_video_fps)
-
-            # log the chapters of the funscript
-            logger.info(f"Chapters of the funscript: {funscript_obj.chapters}")
             
             # Extract actions for backward compatibility
             if not stop_event.is_set():

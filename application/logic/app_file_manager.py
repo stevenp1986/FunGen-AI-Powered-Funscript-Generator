@@ -131,20 +131,33 @@ class AppFileManager:
             return None, f"Error loading funscript: {str(e)}", None, None
 
     def save_raw_funscripts_after_generation(self, video_path: str):
-        if not self.app.funscript_processor: return
-        if not video_path: return
+        if not self.app.funscript_processor: 
+            self.logger.warning("No funscript processor available for saving")
+            return
+        if not video_path: 
+            self.logger.warning("No video path provided for saving funscript")
+            return
 
         primary_actions = self.app.funscript_processor.get_actions('primary')
         secondary_actions = self.app.funscript_processor.get_actions('secondary')
         chapters = self.app.funscript_processor.video_chapters
+        
+        self.logger.info(f"Saving raw funscript: primary_actions={len(primary_actions) if primary_actions else 0}, secondary_actions={len(secondary_actions) if secondary_actions else 0}")
         self.logger.info("Saving raw (pre-post-processing) funscript backup to output folder...")
 
         if primary_actions:
             primary_path = self.get_output_path_for_file(video_path, "_t1_raw.funscript")
+            self.logger.info(f"Saving primary funscript to: {primary_path}")
             self._save_funscript_file(primary_path, primary_actions, chapters)
+        else:
+            self.logger.warning("No primary actions to save")
+            
         if secondary_actions:
             secondary_path = self.get_output_path_for_file(video_path, "_t2_raw.funscript")
+            self.logger.info(f"Saving secondary funscript to: {secondary_path}")
             self._save_funscript_file(secondary_path, secondary_actions, None)
+        else:
+            self.logger.info("No secondary actions to save")
 
     def load_funscript_to_timeline(self, funscript_file_path: str, timeline_num: int = 1):
         actions, error_msg, chapters_as_dicts, chapters_fps_from_file = self._parse_funscript_file(funscript_file_path)

@@ -1860,18 +1860,55 @@ class ControlPanelUI:
 
     def _render_tracking_axes_mode(self, stage_proc):
         """Renders UI elements for tracking axis mode."""
-        axis_modes = [
-            "Both Axes (Up/Down + Left/Right)",
-            "Up/Down Only (Vertical)",
-            "Left/Right Only (Horizontal)",
-            "Omni (Dominant Direction)",
-        ]
+        # Define axis modes based on tracking mode
+        if hasattr(self.app, 'app_state_ui') and hasattr(self.app.app_state_ui, 'selected_tracker_mode'):
+            selected_mode = self.app.app_state_ui.selected_tracker_mode
+            if selected_mode in [self.TrackerMode.OFFLINE_2_STAGE, self.TrackerMode.OFFLINE_3_STAGE, self.TrackerMode.OFFLINE_3_STAGE_MIXED]:
+                axis_modes = [
+                    "Both Axes (Up/Down + Left/Right)",
+                    "Up/Down Only (Vertical)",
+                    "Left/Right Only (Horizontal)"
+                ]
+                {{ ... }}
+    def _render_tracking_axes_mode(self, stage_proc):
+        """Renders UI elements for tracking axis mode."""
+        # Define axis modes based on tracking mode
+        if hasattr(self.app, 'app_state_ui') and hasattr(self.app.app_state_ui, 'selected_tracker_mode'):
+            selected_mode = self.app.app_state_ui.selected_tracker_mode
+            if selected_mode in [self.TrackerMode.OFFLINE_2_STAGE, self.TrackerMode.OFFLINE_3_STAGE, self.TrackerMode.OFFLINE_3_STAGE_MIXED]:
+                axis_modes = [
+                    "Both Axes (Up/Down + Left/Right)",
+                    "Up/Down Only (Vertical)",
+                    "Left/Right Only (Horizontal)"
+                ]
+                # If current mode is omni but not available, fall back to both axes
+                if self.app.tracking_axis_mode == "omni":
+                    self.app.tracking_axis_mode = "both"
+                    self.app.logger.info("Omni mode not available for this tracker mode, falling back to Both Axes", 
+                                      extra={'status_message': True})
+                    self.app.app_settings.set("tracking_axis_mode", "both")
+            else:
+                axis_modes = [
+                    "Both Axes (Up/Down + Left/Right)",
+                    "Up/Down Only (Vertical)",
+                    "Left/Right Only (Horizontal)",
+                    "Omni (Dominant Direction)",
+                ]
+        else:
+            # Fallback to showing all modes if we can't determine the tracking mode
+            axis_modes = [
+                "Both Axes (Up/Down + Left/Right)",
+                "Up/Down Only (Vertical)",
+                "Left/Right Only (Horizontal)",
+                "Omni (Dominant Direction)",
+            ]
+            
         current_axis_mode_idx = 0
         if self.app.tracking_axis_mode == "vertical":
             current_axis_mode_idx = 1
         elif self.app.tracking_axis_mode == "horizontal":
             current_axis_mode_idx = 2
-        elif self.app.tracking_axis_mode == "omni":
+        elif self.app.tracking_axis_mode == "omni" and len(axis_modes) > 3:  # Only allow omni if it's in the list
             current_axis_mode_idx = 3
 
         processor = self.app.processor
@@ -1880,61 +1917,64 @@ class ControlPanelUI:
             or self.app.is_setting_user_roi_mode
             or (processor and processor.is_processing and not processor.pause_event.is_set())
         )
-        if disable_axis_controls:
-            imgui.internal.push_item_flag(imgui.internal.ITEM_DISABLED, True)
-            imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
+        with _DisabledScope(disable_axis_controls):
+            if disable_axis_controls:
+                imgui.internal.push_item_flag(imgui.internal.ITEM_DISABLED, True)
+                imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
 
-        axis_mode_changed, new_axis_mode_idx = imgui.combo("##TrackingAxisModeComboGlobal", current_axis_mode_idx, axis_modes)
-        if axis_mode_changed:
-            old_mode = self.app.tracking_axis_mode
-            if new_axis_mode_idx == 0:
-                self.app.tracking_axis_mode = "both"
-            elif new_axis_mode_idx == 1:
-                self.app.tracking_axis_mode = "vertical"
-            elif new_axis_mode_idx == 2:
-                self.app.tracking_axis_mode = "horizontal"
-            else:
-                self.app.tracking_axis_mode = "omni"
-            if old_mode != self.app.tracking_axis_mode:
-                self.app.project_manager.project_dirty = True
-                self.app.logger.info(f"Tracking axis mode set to: {self.app.tracking_axis_mode}", extra={'status_message': True})
-                self.app.app_settings.set("tracking_axis_mode", self.app.tracking_axis_mode) # Auto-save
-                self.app.energy_saver.reset_activity_timer()
-
-        # Omni smoothing slider (only when Omni mode is selected)
-        if self.app.tracking_axis_mode == "omni":
-            imgui.text("Omni Axis Smoothing")
-            imgui.same_line()
-            imgui.push_item_width(180)
-            cur_alpha = self.app.app_settings.get("omni_axis_alpha", 0.2)
-            ch, new_alpha = imgui.slider_float("##OmniAxisAlpha", cur_alpha, 0.0, 1.0, "%.2f")
-            if ch and new_alpha != cur_alpha:
-                self.app.app_settings.set("omni_axis_alpha", new_alpha)  # Auto-save
-                tr = getattr(self.app, "tracker", None)
-                if tr and hasattr(tr, "omni_axis_alpha"):
-                    try:
-                        tr.omni_axis_alpha = new_alpha
-                    except Exception:
-                        pass
-                self.app.project_manager.project_dirty = True
-                self.app.energy_saver.reset_activity_timer()
-            imgui.pop_item_width()
-            _tooltip_if_hovered("Exponential smoothing factor (EMA) for Omni axis (0=no smoothing, 1=very heavy smoothing).")
-
-        if self.app.tracking_axis_mode != "both":
-            imgui.text("Output Single Axis To:")
-            output_targets = ["Timeline 1 (Primary)", "Timeline 2 (Secondary)"]
-            current_output_target_idx = 1 if self.app.single_axis_output_target == "secondary" else 0
-
-            output_target_changed, new_output_target_idx = imgui.combo("##SingleAxisOutputComboGlobal", current_output_target_idx, output_targets)
-            if output_target_changed:
-                old_target = self.app.single_axis_output_target
-                self.app.single_axis_output_target = "secondary" if new_output_target_idx == 1 else "primary"
-                if old_target != self.app.single_axis_output_target:
+            axis_mode_changed, new_axis_mode_idx = imgui.combo("##TrackingAxisModeComboGlobal", current_axis_mode_idx, axis_modes)
+            if axis_mode_changed:
+                old_mode = self.app.tracking_axis_mode
+                if new_axis_mode_idx == 0:
+                    self.app.tracking_axis_mode = "both"
+                elif new_axis_mode_idx == 1:
+                    self.app.tracking_axis_mode = "vertical"
+                elif new_axis_mode_idx == 2:
+                    self.app.tracking_axis_mode = "horizontal"
+                elif new_axis_mode_idx == 3 and len(axis_modes) > 3:  # Only allow omni if it's in the list
+                    self.app.tracking_axis_mode = "omni"
+                
+                if old_mode != self.app.tracking_axis_mode:
                     self.app.project_manager.project_dirty = True
-                    self.app.logger.info(f"Single axis output target set to: {self.app.single_axis_output_target}", extra={'status_message': True})
-                    self.app.app_settings.set("single_axis_output_target", self.app.single_axis_output_target) # Auto-save
+                    self.app.logger.info(f"Tracking axis mode set to: {self.app.tracking_axis_mode}", extra={'status_message': True})
+                    self.app.app_settings.set("tracking_axis_mode", self.app.tracking_axis_mode) # Auto-save
                     self.app.energy_saver.reset_activity_timer()
+
+            # Omni smoothing slider (only when Omni mode is selected and available)
+            if self.app.tracking_axis_mode == "omni" and len(axis_modes) > 3:
+                imgui.text("Omni Axis Smoothing")
+                imgui.same_line()
+                imgui.push_item_width(180)
+                cur_alpha = self.app.app_settings.get("omni_axis_alpha", 0.2)
+                ch, new_alpha = imgui.slider_float("##OmniAxisAlpha", cur_alpha, 0.0, 1.0, "%.2f")
+                if ch and new_alpha != cur_alpha:
+                    self.app.app_settings.set("omni_axis_alpha", new_alpha)  # Auto-save
+                    tr = getattr(self.app, "tracker", None)
+                    if tr and hasattr(tr, "omni_axis_alpha"):
+                        try:
+                            tr.omni_axis_alpha = new_alpha
+                        except Exception:
+                            pass
+                    self.app.project_manager.project_dirty = True
+                    self.app.energy_saver.reset_activity_timer()
+                imgui.pop_item_width()
+                _tooltip_if_hovered("Exponential smoothing factor (EMA) for Omni axis (0=no smoothing, 1=very heavy smoothing).")
+
+            # Single axis output target
+            if self.app.tracking_axis_mode != "both":
+                imgui.text("Output Single Axis To:")
+                output_targets = ["Timeline 1 (Primary)", "Timeline 2 (Secondary)"]
+                current_output_target_idx = 1 if self.app.single_axis_output_target == "secondary" else 0
+
+                output_target_changed, new_output_target_idx = imgui.combo("##SingleAxisOutputComboGlobal", current_output_target_idx, output_targets)
+                if output_target_changed:
+                    old_target = self.app.single_axis_output_target
+                    self.app.single_axis_output_target = "secondary" if new_output_target_idx == 1 else "primary"
+                    if old_target != self.app.single_axis_output_target:
+                        self.app.project_manager.project_dirty = True
+                        self.app.logger.info(f"Single axis output target set to: {self.app.single_axis_output_target}", extra={'status_message': True})
+                        self.app.app_settings.set("single_axis_output_target", self.app.single_axis_output_target) # Auto-save
+                        self.app.energy_saver.reset_activity_timer()
         if disable_axis_controls:
             imgui.pop_style_var()
             imgui.internal.pop_item_flag()
@@ -2528,7 +2568,7 @@ class ControlPanelUI:
         if proc_tools_disabled and imgui.is_item_hovered():
             imgui.set_tooltip("Disabled while another process is active.")
 
-    # ------- Calibration -------
+# ------- Calibration -------
 
     def _render_latency_calibration(self, calibration_mgr):
         col = self.ControlPanelColors.STATUS_WARNING
@@ -2678,7 +2718,7 @@ class ControlPanelUI:
             max_po = max(1, fs_proc.sg_window_length_input - 1)
             po_val = min(fs_proc.sg_polyorder_input, max_po)
             ch, nv = imgui.slider_int("Polyorder##SGPoly", po_val, 1, max_po)
-            if ch:
+            if ch and nv != fs_proc.sg_polyorder_input:
                 fs_proc.sg_polyorder_input = nv
             if imgui.button("Apply Savitzky-Golay##ApplySG"):
                 prep_op()
