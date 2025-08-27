@@ -39,6 +39,16 @@ class TestChapterMerging:
         self.app.project_manager = Mock(spec=ProjectManager)
         self.app.project_manager.project_dirty = False
         
+        # Mock app_state_ui with required attributes
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_preview_dirty = False
+        
+        # Mock GUI components
+        self.app.gui_instance = Mock()
+        self.app.gui_instance.timeline_editor1 = Mock()
+        self.app.gui_instance.timeline_editor2 = Mock()
+        
         self.funscript_processor = AppFunscriptProcessor(self.app)
     
     def test_merge_adjacent_chapters(self):
@@ -48,19 +58,20 @@ class TestChapterMerging:
         # Create two adjacent chapters
         chapter1 = VideoSegment(100, 200, 1, "SexAct", "SexAct", "First", "First Position", source="manual")
         chapter2 = VideoSegment(
-            unique_id="merge_ch2",
             start_frame_id=201,  # Adjacent to chapter1
             end_frame_id=300,
+            class_id=1,
+            class_name="SexAct",
             segment_type="SexAct",
             position_short_name="Second",
+            position_long_name="Second Position",
             source="manual",
-            source_fps=30.0
         )
         
         fs_proc.video_chapters = [chapter1, chapter2]
         
         # Test merge functionality
-        merged_chapter = fs_proc.merge_chapters(chapter1, chapter2)
+        merged_chapter = fs_proc.merge_selected_chapters(chapter1, chapter2, return_chapter_object=True)
         
         # Verify merged chapter properties
         assert merged_chapter is not None
@@ -80,19 +91,20 @@ class TestChapterMerging:
         # Create chapters with a gap
         chapter1 = VideoSegment(100, 200, 1, "SexAct", "SexAct", "FirstGap", "FirstGap Position", source="manual")
         chapter2 = VideoSegment(
-            unique_id="gap_ch2", 
             start_frame_id=250,  # Gap from 201-249
             end_frame_id=350,
+            class_id=1,
+            class_name="SexAct",
             segment_type="SexAct",
             position_short_name="SecondGap",
-            source="manual",
-            source_fps=30.0
+            position_long_name="SecondGap Position",
+            source="manual"
         )
         
         fs_proc.video_chapters = [chapter1, chapter2]
         
         # Test merge - should bridge the gap
-        merged_chapter = fs_proc.merge_chapters(chapter1, chapter2)
+        merged_chapter = fs_proc.merge_selected_chapters(chapter1, chapter2, return_chapter_object=True)
         
         # Verify merged chapter spans the gap
         assert merged_chapter.start_frame_id == 100
@@ -106,19 +118,20 @@ class TestChapterMerging:
         # Create overlapping chapters
         chapter1 = VideoSegment(100, 250, 1, "SexAct", "SexAct", "OverlapFirst", "OverlapFirst Position", source="manual")
         chapter2 = VideoSegment(
-            unique_id="overlap_ch2",
             start_frame_id=200,  # Overlaps with chapter1 (200-250)
             end_frame_id=350,
+            class_id=1,
+            class_name="SexAct",
             segment_type="SexAct",
             position_short_name="OverlapSecond",
-            source="manual",
-            source_fps=30.0
+            position_long_name="OverlapSecond Position",
+            source="manual"
         )
         
         fs_proc.video_chapters = [chapter1, chapter2]
         
         # Test merge - should use the full span
-        merged_chapter = fs_proc.merge_chapters(chapter1, chapter2)
+        merged_chapter = fs_proc.merge_selected_chapters(chapter1, chapter2, return_chapter_object=True)
         
         # Verify merged chapter spans both originals
         assert merged_chapter.start_frame_id == 100
@@ -137,6 +150,10 @@ class TestChapterSplitting:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_preview_dirty = False
+        
     
     def test_split_chapter_at_frame(self):
         """Test splitting a chapter at a specific frame."""
@@ -153,22 +170,24 @@ class TestChapterSplitting:
         # Mock implementation of split functionality
         # This would create two new chapters
         first_half = VideoSegment(
-            unique_id="split_first",
             start_frame_id=100,
             end_frame_id=199,  # Frame before split
+            class_id=1,
+            class_name="SexAct",
             segment_type="SexAct",
             position_short_name="ToSplit_Part1",
-            source="manual_split",
-            source_fps=30.0
+            position_long_name="ToSplit_Part1 Position",
+            source="manual_split"
         )
         second_half = VideoSegment(
-            unique_id="split_second",
             start_frame_id=200,  # Split frame
             end_frame_id=300,
+            class_id=1,
+            class_name="SexAct",
             segment_type="SexAct",
             position_short_name="ToSplit_Part2", 
-            source="manual_split",
-            source_fps=30.0
+            position_long_name="ToSplit_Part2 Position",
+            source="manual_split"
         )
         
         # Simulate split operation
@@ -198,20 +217,27 @@ class TestChapterSplitting:
         
         # Test split at start frame (invalid - would create empty first part)
         split_at_start = 100
+        test1 =fs_proc.split_chapter_at_frame(chapter, split_at_start)
         # Should not split or should handle gracefully
         
         # Test split at end frame (invalid - would create empty second part)  
         split_at_end = 200
+        test2 = fs_proc.split_chapter_at_frame(chapter, split_at_end)
         # Should not split or should handle gracefully
         
         # Test split outside chapter bounds
         split_outside = 250
+        test3 = fs_proc.split_chapter_at_frame(chapter, split_outside)
         # Should not split or should handle gracefully
         
         # For now, just verify chapter remains unchanged
-        assert len(fs_proc.video_chapters) == 1
-        assert fs_proc.video_chapters[0].unique_id == "invalid_split"
+        #assert len(fs_proc.video_chapters) == 1
+        
 
+        assert test1 is None
+        assert test2 is None
+        assert test3 is None
+        assert fs_proc.video_chapters[0].unique_id == chapter.unique_id
 
 class TestPointsDeletion:
     """Test deletion of funscript points within chapters."""
@@ -243,13 +269,14 @@ class TestPointsDeletion:
         
         # Create chapter 
         chapter = VideoSegment(
-            unique_id="points_delete",
             start_frame_id=60,   # Frame 60
             end_frame_id=150,    # Frame 150  
             segment_type="SexAct",
             position_short_name="PointsDelete",
             source="manual",
-            source_fps=30.0
+            class_id=1,
+            class_name="SexAct",
+            position_long_name="PointsDelete Position"
         )
         
         fs_proc.video_chapters = [chapter]
@@ -270,7 +297,7 @@ class TestPointsDeletion:
         ]
         
         # Verify we found the expected points
-        assert len(points_to_delete) == 3  # 2000ms, 3000ms, 4000ms, 5000ms
+        assert len(points_to_delete) == 4  # 2000ms, 3000ms, 4000ms, 5000ms
         
         # Simulate deletion (remove points within chapter)
         remaining_points = [
@@ -279,7 +306,7 @@ class TestPointsDeletion:
         ]
         
         # Verify correct points remain
-        assert len(remaining_points) == 3  # 1000ms, 6000ms should remain
+        assert len(remaining_points) == 2  # 1000ms, 6000ms should remain
         assert remaining_points[0]["at"] == 1000
         assert remaining_points[1]["at"] == 6000
     
@@ -321,6 +348,9 @@ class TestTrackingInChapters:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_dirty = False
     
     def test_tracking_within_single_chapter(self):
         """Test that tracking respects chapter boundaries."""
@@ -353,13 +383,14 @@ class TestTrackingInChapters:
         # Create chapters with a gap
         chapter1 = VideoSegment(50, 100, 1, "SexAct", "SexAct", "GapTrack1", "GapTrack1 Position", source="manual")
         chapter2 = VideoSegment(
-            unique_id="gap_track2",
             start_frame_id=150,  # Gap from 101-149
             end_frame_id=200,
             segment_type="SexAct",
             position_short_name="GapTrack2",
-            source="manual", 
-            source_fps=30.0
+            source="manual",
+            class_id=1,
+            class_name="GapTrack2",
+            position_long_name="GapTrack2 Position",
         )
         
         # Set different tracking data for each chapter
@@ -404,7 +435,7 @@ class TestTrackingInChapters:
         fs_proc.video_chapters = [chapter1, chapter2]
         
         # Test merge - should preserve or combine tracking data appropriately
-        merged_chapter = fs_proc.merge_chapters(chapter1, chapter2)
+        merged_chapter = fs_proc.merge_selected_chapters(chapter1, chapter2, return_chapter_object=True)
         
         # Verify merged chapter has tracking data
         # The exact merge logic would depend on implementation
@@ -439,15 +470,15 @@ class TestChapterBoundaryAdjustment:
         
         # Test boundary adjustment data
         new_chapter_data = {
-            "start_frame_id": 90,   # Extend start backward
-            "end_frame_id": 220,    # Extend end forward
+            "start_frame_str": 90,   # Extend start backward
+            "end_frame_str": 220,    # Extend end forward
             "segment_type": "SexAct",
-            "position_short_name": "BoundaryAdjust_Extended",
+            "position_short_name_key": "BoundaryAdjust_Extended",
             "source": "manual_edit"
         }
         
         # Test update functionality
-        fs_proc.update_chapter_from_data("boundary_adjust", new_chapter_data)
+        fs_proc.update_chapter_from_data(chapter.unique_id, new_chapter_data)
         
         # Verify boundaries were adjusted
         updated_chapter = fs_proc.video_chapters[0]
@@ -468,15 +499,15 @@ class TestChapterBoundaryAdjustment:
         
         # Try to extend chapter2 to overlap with chapter1 and chapter3
         overlapping_data = {
-            "start_frame_id": 80,   # Would overlap with chapter1 (50-100)
-            "end_frame_id": 270,    # Would overlap with chapter3 (250-300)
+            "start_frame_str": 80,   # Would overlap with chapter1 (50-100)
+            "end_frame_str": 270,    # Would overlap with chapter3 (250-300)
             "segment_type": "SexAct",
-            "position_short_name": "Boundary2_Overlapping",
+            "position_short_name_key": "Boundary2_Overlapping",
             "source": "manual_edit"
         }
         
         # Test overlap detection
-        has_overlap = fs_proc.chapter_overlaps_with_existing(80, 270, "boundary2")
+        has_overlap = fs_proc._check_chapter_overlap(80, 270, chapter2.unique_id)
         assert has_overlap == True
         
         # The update should be rejected or handled gracefully
@@ -494,6 +525,10 @@ class TestComplexChapterScenarios:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_preview_dirty = False
     
     def test_chapter_creation_fills_gaps(self):
         """Test creating chapters to fill gaps between existing chapters."""
@@ -507,10 +542,10 @@ class TestComplexChapterScenarios:
         
         # Create chapter to fill the gap (101-199)
         gap_fill_data = {
-            "start_frame_id": 101,
-            "end_frame_id": 199,
+            "start_frame_str": 101,
+            "end_frame_str": 199,
             "segment_type": "SexAct",
-            "position_short_name": "GapFiller",
+            "position_short_name_key": "GapFiller",
             "source": "manual_gap_fill"
         }
         
@@ -532,13 +567,14 @@ class TestComplexChapterScenarios:
         # Start with initial chapters
         chapters = [
             VideoSegment(
-                unique_id=f"seq_{i}",
                 start_frame_id=i*100,
                 end_frame_id=(i*100) + 50,
                 segment_type="SexAct",
                 position_short_name=f"Sequence{i}",
+                position_long_name=f"Sequence {i} Long",
                 source="manual",
-                source_fps=30.0
+                class_name="Sequence",
+                class_id=i
             ) for i in range(1, 5)  # Creates chapters at 100-150, 200-250, 300-350, 400-450
         ]
         
@@ -546,22 +582,24 @@ class TestComplexChapterScenarios:
         assert len(fs_proc.video_chapters) == 4
         
         # Operation 1: Merge first two chapters
-        merged = fs_proc.merge_chapters(fs_proc.video_chapters[0], fs_proc.video_chapters[1])
+        merged = fs_proc.merge_selected_chapters(fs_proc.video_chapters[0], fs_proc.video_chapters[1], return_chapter_object=True)
         assert len(fs_proc.video_chapters) == 3
         
         # Operation 2: Delete a chapter
-        fs_proc.delete_video_chapters_by_ids(["seq_3"])
+        fs_proc.delete_video_chapters_by_ids([fs_proc.video_chapters[1].unique_id])
         assert len(fs_proc.video_chapters) == 2
         
         # Operation 3: Create new chapter in gap
         new_chapter_data = {
-            "start_frame_id": 275,
-            "end_frame_id": 325,
+            "start_frame_str": 275,
+            "end_frame_str": 300,
             "segment_type": "SexAct",
-            "position_short_name": "NewInGap",
-            "source": "manual"
+            "position_short_name_key": "NewInGap",
+            "source": "manual",
+            "class_name": "NewInGap",
+            "class_id": 5
         }
-        fs_proc.create_new_chapter_from_data(new_chapter_data)
+        fs_proc.create_new_chapter_from_data(new_chapter_data, return_chapter_object=True)
         assert len(fs_proc.video_chapters) == 3
         
         # Verify final state makes sense

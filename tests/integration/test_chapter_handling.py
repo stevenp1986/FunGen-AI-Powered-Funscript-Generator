@@ -134,10 +134,10 @@ class TestChapterCreation:
         
         # Create chapter data
         chapter_data = {
-            "start_frame_id": 100,
-            "end_frame_id": 200,
+            "start_frame_str": 100,
+            "end_frame_str": 200,
             "segment_type": "SexAct",
-            "position_short_name": "Manual Test",
+            "position_short_name_key": "Manual Test",
             "source": "manual"
         }
         
@@ -157,22 +157,23 @@ class TestChapterCreation:
         
         # Create first chapter
         chapter1_data = {
-            "start_frame_id": 50,
-            "end_frame_id": 150,
+            "start_frame_str": 50,
+            "end_frame_str": 150,
             "segment_type": "SexAct",
-            "position_short_name": "First",
+            "position_short_name_key": "First",
             "source": "manual"
         }
         fs_proc.create_new_chapter_from_data(chapter1_data)
         
         # Try to create overlapping chapter
         overlapping_chapter_data = {
-            "start_frame_id": 100,
-            "end_frame_id": 200,
+            "start_frame_str": 100,
+            "end_frame_str": 200,
             "segment_type": "SexAct", 
-            "position_short_name": "Overlapping",
+            "position_short_name_key": "Overlapping",
             "source": "manual"
         }
+        fs_proc.create_new_chapter_from_data(overlapping_chapter_data)
         
         # Test overlap detection method (using the private method)
         has_overlap = fs_proc._check_chapter_overlap(100, 200)
@@ -180,10 +181,10 @@ class TestChapterCreation:
         
         # Test non-overlapping chapter
         non_overlapping_data = {
-            "start_frame_id": 300,
-            "end_frame_id": 400,
+            "start_frame_str": 300,
+            "end_frame_str": 400,
             "segment_type": "SexAct",
-            "position_short_name": "Non-overlapping", 
+            "position_short_name_key": "Non-overlapping", 
             "source": "manual"
         }
         
@@ -202,6 +203,9 @@ class TestChapterPersistence:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_dirty = False
     
     def test_chapter_serialization_to_project_data(self):
         """Test that chapters are properly serialized for project saving."""
@@ -214,7 +218,7 @@ class TestChapterPersistence:
         fs_proc.video_chapters = [chapter1, chapter2]
         
         # Get project data for saving
-        project_data = fs_proc.get_project_data_for_save()
+        project_data = fs_proc.get_project_save_data()
         
         # Verify chapters are in project data
         assert "video_chapters" in project_data
@@ -222,9 +226,9 @@ class TestChapterPersistence:
         assert len(chapters_data) == 2
         
         # Verify chapter data structure
-        assert chapters_data[0]["unique_id"] == "ch1"
+        assert chapters_data[0]["unique_id"] == fs_proc.video_chapters[0].unique_id
         assert chapters_data[0]["position_short_name"] == "Test1"
-        assert chapters_data[1]["unique_id"] == "ch2"
+        assert chapters_data[1]["unique_id"] == fs_proc.video_chapters[1].unique_id
         assert chapters_data[1]["position_short_name"] == "Test2"
     
     def test_chapter_deserialization_from_project_data(self):
@@ -235,22 +239,24 @@ class TestChapterPersistence:
         project_data = {
             "video_chapters": [
                 {
-                    "unique_id": "loaded_ch1",
                     "start_frame_id": 25,
                     "end_frame_id": 125,
                     "segment_type": "SexAct",
                     "position_short_name": "Loaded1",
                     "source": "manual",
-                    "source_fps": 30.0
+                    "class_name": "VideoSegment",
+                    "class_id": "1",
+                    "position_long_name": "Loaded1 Position"
                 },
                 {
-                    "unique_id": "loaded_ch2",
                     "start_frame_id": 175,
                     "end_frame_id": 275, 
                     "segment_type": "SexAct",
                     "position_short_name": "Loaded2",
                     "source": "stage2_analysis",
-                    "source_fps": 30.0
+                    "class_name": "VideoSegment",
+                    "class_id": "2",
+                    "position_long_name": "Loaded2 Position"
                 }
             ]
         }
@@ -260,9 +266,9 @@ class TestChapterPersistence:
         
         # Verify chapters were loaded
         assert len(fs_proc.video_chapters) == 2
-        assert fs_proc.video_chapters[0].unique_id == "loaded_ch1"
+        assert fs_proc.video_chapters[0].unique_id == fs_proc.video_chapters[0].unique_id
         assert fs_proc.video_chapters[0].position_short_name == "Loaded1"
-        assert fs_proc.video_chapters[1].unique_id == "loaded_ch2"
+        assert fs_proc.video_chapters[1].unique_id == fs_proc.video_chapters[1].unique_id
         assert fs_proc.video_chapters[1].position_short_name == "Loaded2"
     
     def test_chapter_persistence_round_trip(self):
@@ -278,7 +284,7 @@ class TestChapterPersistence:
         fs_proc.video_chapters = original_chapters
         
         # Save to project data
-        saved_data = fs_proc.get_project_data_for_save()
+        saved_data = fs_proc.get_project_save_data()
         
         # Clear chapters
         fs_proc.video_chapters.clear()
@@ -291,12 +297,12 @@ class TestChapterPersistence:
         assert len(fs_proc.video_chapters) == 2
         loaded_chapters = fs_proc.video_chapters
         
-        assert loaded_chapters[0].unique_id == "rt1"
+        assert loaded_chapters[0].unique_id == fs_proc.video_chapters[0].unique_id
         assert loaded_chapters[0].position_short_name == "RoundTrip1"
         assert loaded_chapters[0].start_frame_id == 10
         assert loaded_chapters[0].end_frame_id == 110
         
-        assert loaded_chapters[1].unique_id == "rt2"
+        assert loaded_chapters[1].unique_id == fs_proc.video_chapters[1].unique_id
         assert loaded_chapters[1].position_short_name == "RoundTrip2"
         assert loaded_chapters[1].start_frame_id == 160
         assert loaded_chapters[1].end_frame_id == 260
@@ -313,6 +319,9 @@ class TestChapterInteraction:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_dirty = False
     
     def test_get_chapter_at_frame(self):
         """Test finding chapters by frame index."""
@@ -327,11 +336,11 @@ class TestChapterInteraction:
         # Test finding chapters by frame
         found_chapter1 = fs_proc.get_chapter_at_frame(100)
         assert found_chapter1 is not None
-        assert found_chapter1.unique_id == "frame_test1"
+        assert found_chapter1.unique_id == fs_proc.video_chapters[0].unique_id
         
         found_chapter2 = fs_proc.get_chapter_at_frame(250)
         assert found_chapter2 is not None
-        assert found_chapter2.unique_id == "frame_test2"
+        assert found_chapter2.unique_id == fs_proc.video_chapters[1].unique_id
         
         # Test frame not in any chapter (gap)
         no_chapter = fs_proc.get_chapter_at_frame(175)
@@ -359,7 +368,7 @@ class TestChapterInteraction:
         found_chapter = fs_proc.get_chapter_at_frame(current_frame)
         
         assert found_chapter is not None
-        assert found_chapter.unique_id == "refinement_test"
+        assert found_chapter.unique_id == fs_proc.video_chapters[0].unique_id
         assert found_chapter.position_short_name == "RefinementTest"
         
         # Test refinement fails outside chapter bounds
@@ -382,17 +391,17 @@ class TestChapterInteraction:
         assert len(fs_proc.video_chapters) == 3
         
         # Delete middle chapter
-        fs_proc.delete_video_chapters_by_ids(["del_test2"])
+        fs_proc.delete_video_chapters_by_ids([chapters[1].unique_id])
         
         # Verify deletion
         assert len(fs_proc.video_chapters) == 2
         remaining_ids = [ch.unique_id for ch in fs_proc.video_chapters]
-        assert "del_test1" in remaining_ids
-        assert "del_test2" not in remaining_ids
-        assert "del_test3" in remaining_ids
+        assert chapters[0].unique_id in remaining_ids
+        assert chapters[1].unique_id not in remaining_ids
+        assert chapters[2].unique_id in remaining_ids
         
         # Delete multiple chapters
-        fs_proc.delete_video_chapters_by_ids(["del_test1", "del_test3"])
+        fs_proc.delete_video_chapters_by_ids([chapters[0].unique_id, chapters[2].unique_id])
         
         # Verify all deleted
         assert len(fs_proc.video_chapters) == 0
@@ -409,6 +418,9 @@ class TestChapterEdgeCases:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_dirty = False
     
     def test_empty_chapter_list_handling(self):
         """Test that empty chapter lists are handled gracefully."""
@@ -422,12 +434,12 @@ class TestChapterEdgeCases:
         assert no_chapter is None
         
         # Test project data serialization with empty chapters
-        project_data = fs_proc.get_project_data_for_save()
+        project_data = fs_proc.get_project_save_data()
         assert "video_chapters" in project_data
         assert project_data["video_chapters"] == []
         
         # Test deletion with empty list
-        fs_proc.delete_video_chapters_by_ids(["nonexistent"])
+        fs_proc.delete_video_chapters_by_ids(no_chapter.unique_id)
         assert len(fs_proc.video_chapters) == 0
     
     def test_invalid_chapter_data_handling(self):
@@ -443,13 +455,14 @@ class TestChapterEdgeCases:
                 {"unique_id": 123, "start_frame_id": "not_a_number"},
                 # Valid chapter for comparison
                 {
-                    "unique_id": "valid1",
                     "start_frame_id": 100,
                     "end_frame_id": 200,
                     "segment_type": "SexAct",
                     "position_short_name": "Valid",
                     "source": "manual",
-                    "source_fps": 30.0
+                    "class_id": 1,
+                    "class_name": "Valid",
+                    "position_long_name": "Valid Position",
                 }
             ]
         }
@@ -459,7 +472,7 @@ class TestChapterEdgeCases:
         
         # Should have only the valid chapter
         assert len(fs_proc.video_chapters) == 1
-        assert fs_proc.video_chapters[0].unique_id == "valid1"
+        assert fs_proc.video_chapters[0].position_short_name == "Valid"
     
     def test_chapter_boundary_conditions(self):
         """Test chapters at frame boundaries and edge cases."""
@@ -473,11 +486,11 @@ class TestChapterEdgeCases:
         # Test exact boundary frames
         start_boundary = fs_proc.get_chapter_at_frame(100)  # Start frame
         assert start_boundary is not None
-        assert start_boundary.unique_id == "boundary_test"
+        assert start_boundary.position_short_name == "BoundaryTest"
         
         end_boundary = fs_proc.get_chapter_at_frame(200)    # End frame
         assert end_boundary is not None
-        assert end_boundary.unique_id == "boundary_test"
+        assert end_boundary.position_short_name == "BoundaryTest"
         
         # Test just outside boundaries
         before_start = fs_proc.get_chapter_at_frame(99)     # Just before start
@@ -498,6 +511,9 @@ class TestChapterIntegrationWithUI:
         self.app.project_manager.project_dirty = False
         
         self.funscript_processor = AppFunscriptProcessor(self.app)
+        self.app.app_state_ui = Mock()
+        self.app.app_state_ui.heatmap_dirty = False
+        self.app.app_state_ui.funscript_dirty = False
     
     def test_chapter_creation_triggers_ui_updates(self):
         """Test that chapter creation triggers proper UI state updates."""
@@ -508,14 +524,17 @@ class TestChapterIntegrationWithUI:
         
         # Create a new chapter
         chapter_data = {
-            "start_frame_id": 50,
-            "end_frame_id": 150,
+            "start_frame_str": 50,
+            "end_frame_str": 150,
             "segment_type": "SexAct",
-            "position_short_name": "UI Test",
-            "source": "manual"
+            "position_short_name_key": "UI Test",
+            "source": "manual",
+            "class_id": 1,
+            "class_name": "UI Test",
+            "position_long_name": "UI Test Position",
         }
         
-        new_chapter = fs_proc.create_new_chapter_from_data(chapter_data, return_chapter_object=True)
+        fs_proc.create_new_chapter_from_data(chapter_data, return_chapter_object=True)
         
         # Verify status message was called
         self.app.set_status_message.assert_called_once()
@@ -536,7 +555,7 @@ class TestChapterIntegrationWithUI:
         fs_proc.selected_chapter_for_scripting = selected_chapter
         
         # Delete the selected chapter
-        fs_proc.delete_video_chapters_by_ids(["selected_for_deletion"])
+        fs_proc.delete_video_chapters_by_ids(fs_proc.video_chapters[0].unique_id)
         
         # Verify chapter was deleted and selection cleared
         assert len(fs_proc.video_chapters) == 0

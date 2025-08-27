@@ -129,8 +129,7 @@ def test_cli_file_discovery_patterns():
                 f.write('test content')
         
         # Test video file discovery logic
-        result = subprocess.run([
-            'python', '-c', f'''
+        cmd = '''
 import sys
 import os
 sys.path.insert(0, ".")
@@ -158,19 +157,28 @@ def discover_video_files(input_path, recursive=False):
     return sorted(found_files)
 
 # Test non-recursive
-videos_dir = os.path.join("{temp_dir}", "videos")
+videos_dir = os.path.join(r"{0}", "videos")
 non_recursive = discover_video_files(videos_dir, recursive=False)
-print(f"Non-recursive found: {{len(non_recursive)}} files")
+print("Non-recursive found: {{0}} files".format(len(non_recursive)))
 for f in non_recursive:
-    print(f"  {{os.path.basename(f)}}")
+    print("  {{0}}".format(os.path.basename(f)))
 
 # Test recursive
 recursive = discover_video_files(videos_dir, recursive=True)
-print(f"Recursive found: {{len(recursive)}} files")
+print("Recursive found: {{0}} files".format(len(recursive)))
 for f in recursive:
-    print(f"  {{os.path.relpath(f, videos_dir)}}")
+    rel_path = os.path.relpath(f, videos_dir).replace('\\\\', '/')
+    print("  {{0}}".format(rel_path))
 '''
-        ], capture_output=True, text=True, timeout=10)
+        
+        # Double the backslashes for the Python command
+        escaped_temp_dir = temp_dir.replace('\\', '\\\\')
+        result = subprocess.run(
+            ['python', '-c', cmd.format(escaped_temp_dir)],
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
         
         assert result.returncode == 0
         output = result.stdout
@@ -294,29 +302,38 @@ def test_settings_and_configuration():
         
         # Test settings access
         assert hasattr(app, 'app_settings')
-        assert isinstance(app.app_settings, dict)
         
-        # Test common settings exist
+        # Verify it's an AppSettings instance
+        from application.classes.settings_manager import AppSettings
+        assert isinstance(app.app_settings, AppSettings)
+        
+        # Test common settings exist and have expected types
         common_settings = [
-            'theme', 'window_width', 'window_height', 
-            'autosave_enabled', 'autosave_interval_seconds'
+            'yolo_det_model_path', 'yolo_pose_model_path', 'output_folder_path',
+            'logging_level', 'ui_view_mode', 'window_width', 'window_height'
         ]
         
         for setting in common_settings:
-            # Settings may or may not exist, but accessing shouldn't crash
-            value = app.app_settings.get(setting, 'default')
-            assert value is not None
+            value = app.app_settings.get(setting)
+            assert value is not None, f"Setting {setting} returned None"
+            
+        # Verify some basic settings have expected types
+        assert isinstance(app.app_settings.get('yolo_det_model_path', ''), str)
+        assert isinstance(app.app_settings.get('yolo_pose_model_path', ''), str)
+        assert isinstance(app.app_settings.get('output_folder_path', ''), str)
+        assert app.app_settings.get('logging_level') in [
+            'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL', None]
         
         # Test settings modification (temporary)
-        original_test = app.app_settings.get('test_cli_setting', None)
-        app.app_settings['test_cli_setting'] = 'test_value'
-        assert app.app_settings['test_cli_setting'] == 'test_value'
+        original_test = app.app_settings.get('test_cli_setting')
+        app.app_settings.set('test_cli_setting', 'test_value')
+        assert app.app_settings.get('test_cli_setting') == 'test_value'
         
         # Cleanup
         if original_test is None:
-            app.app_settings.pop('test_cli_setting', None)
+            app.app_settings.set('test_cli_setting', None)  # or app.app_settings.delete('test_cli_setting')
         else:
-            app.app_settings['test_cli_setting'] = original_test
+            app.app_settings.set('test_cli_setting', original_test)
 
 @pytest.mark.integration
 def test_funscript_export_import_cycle():

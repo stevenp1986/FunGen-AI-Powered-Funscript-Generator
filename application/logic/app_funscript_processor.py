@@ -1149,6 +1149,89 @@ class AppFunscriptProcessor:
         self.app.set_status_message("Chapters merged. Scripting range cleared.")
 
         return merged_chapter if return_chapter_object else None
+    
+    def split_chapter_at_frame(self, chapter: VideoSegment, frame_id: int):
+        """Split a chapter at the given frame_id.
+        
+        Returns a tuple (first_half, second_half) on success, or None if invalid.
+        Invalid when:
+        - chapter not in current list
+        - frame_id <= start or frame_id > end
+        - would produce empty ranges
+        """
+        try:
+            if chapter not in self.video_chapters:
+                self.logger.warning("split_chapter_at_frame: chapter not found in current list")
+                return None
+
+            start = int(chapter.start_frame_id)
+            end = int(chapter.end_frame_id)
+            split_at = int(frame_id)
+
+            # Validate split position: strictly inside (start, end)
+            if split_at <= start or split_at >= end:
+                self.logger.info(f"split_chapter_at_frame: invalid split position {split_at} for {start}-{end}")
+                return None
+
+            first_start = start
+            first_end = split_at - 1
+            second_start = split_at
+            second_end = end
+
+            # Ensure non-empty segments
+            if first_end < first_start or second_end < second_start:
+                self.logger.info("split_chapter_at_frame: split would create empty segment(s)")
+                return None
+
+            # Build two new segments inheriting metadata
+            first_half = VideoSegment(
+                start_frame_id=first_start,
+                end_frame_id=first_end,
+                class_id=getattr(chapter, 'class_id', None),
+                class_name=getattr(chapter, 'class_name', ''),
+                segment_type=getattr(chapter, 'segment_type', 'SexAct'),
+                position_short_name=f"{getattr(chapter, 'position_short_name', 'Chapter')}_Part1",
+                position_long_name=f"{getattr(chapter, 'position_long_name', getattr(chapter, 'class_name', ''))} (Part 1)",
+                source=getattr(chapter, 'source', 'manual'),
+                user_roi_fixed=getattr(chapter, 'user_roi_fixed', None),
+                user_roi_initial_point_relative=getattr(chapter, 'user_roi_initial_point_relative', None),
+                refined_track_id=getattr(chapter, 'refined_track_id', None),
+            )
+
+            second_half = VideoSegment(
+                start_frame_id=second_start,
+                end_frame_id=second_end,
+                class_id=getattr(chapter, 'class_id', None),
+                class_name=getattr(chapter, 'class_name', ''),
+                segment_type=getattr(chapter, 'segment_type', 'SexAct'),
+                position_short_name=f"{getattr(chapter, 'position_short_name', 'Chapter')}_Part2",
+                position_long_name=f"{getattr(chapter, 'position_long_name', getattr(chapter, 'class_name', ''))} (Part 2)",
+                source=getattr(chapter, 'source', 'manual'),
+                user_roi_fixed=getattr(chapter, 'user_roi_fixed', None),
+                user_roi_initial_point_relative=getattr(chapter, 'user_roi_initial_point_relative', None),
+                refined_track_id=getattr(chapter, 'refined_track_id', None),
+            )
+
+            # Replace original chapter
+            try:
+                self.video_chapters.remove(chapter)
+            except ValueError:
+                pass
+            self.video_chapters.extend([first_half, second_half])
+            self.video_chapters.sort(key=lambda c: c.start_frame_id)
+
+            # Sync to funscript and mark UI/state dirty
+            self._sync_chapters_to_funscript()
+            self.app.project_manager.project_dirty = True
+            if hasattr(self.app, 'app_state_ui') and self.app.app_state_ui:
+                self.app.app_state_ui.heatmap_dirty = True
+                self.app.app_state_ui.funscript_preview_dirty = True
+            self.app.set_status_message(f"Chapter split at frame {split_at}.")
+            
+            return (first_half, second_half)
+        except Exception as e:
+            self.logger.error(f"Error in split_chapter_at_frame: {e}", exc_info=True)
+            return None
 
     def finalize_merge_after_gap_tracking(self, chapter1_id: str, chapter2_id: str):
         self.logger.info(f"Finalizing merge after gap tracking for chapters: {chapter1_id}, {chapter2_id}")
